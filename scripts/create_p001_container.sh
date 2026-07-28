@@ -19,10 +19,15 @@ fi
 mount_args=(
   -v "${HOST_ROOT}:/workspace/p001"
   -v "${MODEL_ROOT}:/models/Qwen3.6-27B:ro"
-  -v "/data3:/data3"
-  -v "/usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons"
-  -v "/usr/local/Ascend/driver:/usr/local/Ascend/driver"
+  -v "/usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro"
+  -v "/usr/local/Ascend/driver:/usr/local/Ascend/driver:ro"
+  --device "/dev/davinci_manager:/dev/davinci_manager"
+  --device "/dev/devmm_svm:/dev/devmm_svm"
+  --device "/dev/hisi_hdc:/dev/hisi_hdc"
 )
+for device_index in $(seq 0 15); do
+  mount_args+=(--device "/dev/davinci${device_index}:/dev/davinci${device_index}")
+done
 for bind_path in \
   /usr/local/sbin/npu-smi \
   /usr/local/bin/npu-smi \
@@ -31,15 +36,13 @@ for bind_path in \
   /etc/hccn.conf
 do
   if [[ -e "${bind_path}" ]]; then
-    mount_args+=(-v "${bind_path}:${bind_path}")
+    mount_args+=(-v "${bind_path}:${bind_path}:ro")
   fi
 done
 
 docker run -d \
   --name "${CONTAINER}" \
-  --privileged \
-  --network host \
-  --ipc host \
+  --shm-size 64g \
   -e HCCL_CONNECT_TIMEOUT=1800 \
   -e TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
   -e ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \

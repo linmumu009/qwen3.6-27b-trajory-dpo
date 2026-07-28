@@ -148,7 +148,7 @@ verified RPO 相对 matched continued-SFT：
   - 支持 base PI-SFT、continued-SFT、DPO、RPO、randomized-RPO；
   - 固定 `TP8 × PP1 × CP2 × SP`、40K、LoRA r8/alpha32；
   - 对每次 run 保存环境版本、输入哈希、NPU 前后状态和退出码。
-- 新增 `scripts/create_p001_container.sh`，复刻 6 号机已验证的 privileged/host-network/host-IPC 和 Ascend 驱动挂载方式。
+- 新增 `scripts/create_p001_container.sh`。安全审查后采用最小权限方案：非 privileged、bridge 网络、独立 64GB shared memory，仅显式映射 16 张 NPU 与必要 Ascend 管理设备；不挂载整块 `/data3`。
 - 已将 6 号机约 65MB 的压缩运行补丁包和冻结数据安全中转到 Git 忽略目录；未搬运 18.7GB 整镜像。
 
 冻结哈希：
