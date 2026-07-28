@@ -71,7 +71,7 @@ verified RPO 相对 matched continued-SFT：
 
 ## 下一轮实验：P-001 轨迹 RPO pilot
 
-状态：`preparing`
+状态：`data-frozen / runtime-migration`
 
 ### 目标
 
@@ -85,7 +85,7 @@ verified RPO 相对 matched continued-SFT：
 
 - 主训练上限：40K。
 - 工程拓扑：`TP8 × PP1 × CP2 × SP`，16 张 Ascend NPU。
-- 初始候选：Qwen3.6-27B base 与现有通用 reasoning-SFT；先用冻结 PI 基线评测选择，禁止仅凭 checkpoint 名称指定。
+- 起始策略：Qwen3.6-27B base 先在 101 条 chosen 轨迹上做 matched PI-SFT；不直接混入现有通用 reasoning-SFT，避免把不同训练历史混入因果对照。
 - 每个偏好条件的 optimized policy 与 reference policy 使用同一个 matched chosen-SFT 起点。
 - 主目标候选：
   - DPO beta：`0.1`
@@ -93,6 +93,11 @@ verified RPO 相对 matched continued-SFT：
   - learning rate：首轮从 `5e-5` 开始
   - LoRA：`r=8, alpha=32`
   - BF16、full recompute
+- 正式单 seed pilot 计划在同一 PI-SFT 起点比较：
+  - continued-SFT：75 steps
+  - verified DPO：保存并检查 25 / 50 / 75 steps
+  - verified RPO：75 steps
+  - randomized-label RPO：75 steps
 - 先做 1-step 和短程 smoke；通过数值、显存、checkpoint 和恢复门槛后才启动正式训练。
 
 ### 评测门槛
@@ -124,3 +129,41 @@ verified RPO 相对 matched continued-SFT：
 
 - 数据、工程和目标函数证据足够进入 P-001 pilot。
 - 正式开训前仍需冻结独立 heldout、起始 checkpoint 和数据拆分，并释放 5 号机的显存保留进程。
+
+### 2026-07-28：E-001 P-001 数据冻结与运行环境复刻
+
+更新内容：
+
+- 新增 `scripts/freeze_p001_split.py`，逐行验证 preference 与 manifest 对齐、chosen/rejected prompt 前缀一致、任务键唯一和 train/heldout 无 prompt 泄漏。
+- 固定 v15+v20 为训练集，共 101 对；固定 v21 为内部 heldout，共 40 个 prompt；两者 prompt SHA256 重叠为 0。
+- 训练集构成：
+  - 版本：v15 50、v20 51
+  - 类型：DWH 20、Hybrid 37、KB 44
+  - 偏好：`correct > partial` 68、`correct > incorrect` 33
+  - 长度方向：chosen 更长 60、rejected 更长 41
+- 新增 seed-42 的平衡随机标签对照：101 对中固定交换 50 对 chosen/rejected，保留 prompt 与样本边际分布。
+- 新增训练集中真实最坏长度的 preference/SFT worst1 烟测输入。
+- 新增 `docker/Dockerfile.megatron-dpo-runtime`，精确复刻 6 号机已通过 40K 测试的 Python 运行层。
+- 新增 `scripts/run_p001_megatron_inner.sh`：
+  - 支持 base PI-SFT、continued-SFT、DPO、RPO、randomized-RPO；
+  - 固定 `TP8 × PP1 × CP2 × SP`、40K、LoRA r8/alpha32；
+  - 对每次 run 保存环境版本、输入哈希、NPU 前后状态和退出码。
+- 新增 `scripts/create_p001_container.sh`，复刻 6 号机已验证的 privileged/host-network/host-IPC 和 Ascend 驱动挂载方式。
+- 已将 6 号机约 65MB 的压缩运行补丁包和冻结数据安全中转到 Git 忽略目录；未搬运 18.7GB 整镜像。
+
+冻结哈希：
+
+| 产物 | SHA256 |
+|---|---|
+| 40K 源 preference | `7e108af5e6f5695804159c997ca54350febd8e5f3eac2055a613466518a88d17` |
+| 40K 源 manifest | `dfde4e51037a0dabf14abbe5c37edbff9c5052c396d9defb8ed2add9da95eeac` |
+| P-001 train preference（101） | `6057a2cb70fb28cf23ba4b2477bde703eb4eb62beb639ee4a54c42b4c6ee6dd4` |
+| P-001 chosen SFT（101） | `eba20b9aacdf0de22fc09f5326306543d8c80b318c66a2e5ba9525270bb5f80c` |
+| P-001 randomized preference（101） | `da62b39d532ee13ebf6b32683965e71f6e8d8619d97d3b05173e0e34af038695` |
+| P-001 internal heldout tasks（40） | `ecd6dfd35ee8d29af475bcc33566186bc0b4c888e0e5c585f300de4c5ac4c99e` |
+| 运行补丁归档 | `fe77cad7a3068257e5f51f1ec5901b29d41dc4bd86f3f5eeba05df0ad15aff10` |
+
+结论：
+
+- P-001 的训练/内部 heldout 已冻结，可进入 5 号机 40K worst1 烟测。
+- v21 属于严格未参与训练的内部 heldout，但团队已经接触过该版本，不能代替最终的全新 PI 任务集；它适合 pilot 选型，不足以单独支撑对外泛化结论。

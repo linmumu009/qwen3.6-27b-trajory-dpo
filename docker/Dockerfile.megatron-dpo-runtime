@@ -1,0 +1,28 @@
+FROM mindspeed-llm:26.0.0-a3-sshd-yehairui
+
+RUN python -m pip install --no-cache-dir --upgrade \
+    transformers==5.12.1 \
+    peft==0.19.1 \
+    trl==0.29.1 \
+    datasets==4.8.4 \
+    accelerate==1.13.0 \
+    tokenizers==0.22.2 \
+    safetensors==0.7.0 \
+    huggingface-hub==1.21.0 \
+    addict \
+    attrdict \
+    binpacking \
+    dacite \
+    json-repair \
+    modelscope \
+    openai \
+    oss2 \
+    rouge \
+    sentencepiece \
+    simplejson \
+    sortedcontainers \
+    tensorboard \
+    tiktoken \
+    transformers-stream-generator \
+    zstandard \
+ && python -m pip uninstall -y torchaudio
