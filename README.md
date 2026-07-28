@@ -9,6 +9,8 @@ Qwen3.6-27B 轨迹偏好训练工程。目标不是只证明 DPO 能运行，而
 - 不以 training loss 或 DPO margin 单独证明模型质量提升；必须与 matched continued-SFT、普通 DPO 和独立 heldout 对照。
 - 不把缓存/推理性能收益混同为模型权重质量收益。
 - 服务器登录方式、私钥说明和含内部证据的原始报告不提交到 GitHub。
+- Windows 只作为 SSH 控制端，不承载模型、checkpoint 或评测数据中转；5/6 号机的数据面必须走服务器内网。
+- 只允许使用或新建 `llin-*` 容器和镜像；不得使用、修改或覆盖其他人的容器与镜像。
 
 ## 当前结论
 
@@ -31,6 +33,8 @@ verified RPO 相对 matched continued-SFT：
 - 三个 seed 的 full-success 增益：`+6.25 / +4.69 / +5.73` 个百分点
 
 因此下一轮以 **chosen-SFT warm start + verified RPO** 为主线；普通 DPO保留为对照，不作为默认训练目标。
+
+多机工程方面，5→6 内网 checkpoint 直传、校验和原子发布已通过；6 号基座推理已通过。当前仍不能宣告完整训练/评测闭环通过：vLLM-Ascend 0.23 的静态 PEFT LoRA 路径虽能注册 adapter，但在两个真实 checkpoint 上均产生重复感叹号，不能作为质量验收路径。P-001 将改用训练后 LoRA 合并模型进行离线评测，或复用老板已验证的动态 LoRA 同步链路。
 
 ## 已核实资产
 
@@ -71,7 +75,7 @@ verified RPO 相对 matched continued-SFT：
 
 ## 下一轮实验：P-001 轨迹 RPO pilot
 
-状态：`data-frozen / runtime-migration`
+状态：`data-frozen / multihost-data-plane-passed / training-runtime-gated`
 
 ### 目标
 
@@ -92,6 +96,7 @@ verified RPO 相对 matched continued-SFT：
   - RPO alpha：`1.0`
   - learning rate：首轮从 `5e-5` 开始
   - LoRA：`r=8, alpha=32`
+  - LoRA target modules：`linear_qkv + linear_fc1`，沿用老板动态 rollout 已验证契约；不再使用 `all-linear`
   - BF16、full recompute
 - 正式单 seed pilot 计划在同一 PI-SFT 起点比较：
   - continued-SFT：75 steps
@@ -149,7 +154,7 @@ verified RPO 相对 matched continued-SFT：
   - 固定 `TP8 × PP1 × CP2 × SP`、40K、LoRA r8/alpha32；
   - 对每次 run 保存环境版本、输入哈希、NPU 前后状态和退出码。
 - 新增 `scripts/create_p001_container.sh`，默认使用非 privileged、host network/IPC，仅显式映射 16 张 NPU 与必要 Ascend 管理设备；不挂载整块 `/data3`。
-- 已将 6 号机约 65MB 的压缩运行补丁包和冻结数据安全中转到 Git 忽略目录；未搬运 18.7GB 整镜像。
+- 仓库准备阶段已将 6 号机约 65MB 的压缩运行补丁包和冻结数据放入 Git 忽略目录；未搬运 18.7GB 整镜像，该动作不属于 5→6 模型交接数据面。
 - 首次容器 import 自检定位到两个隐含条件：容器工作目录必须避开基座自带 Megatron；且 `transformer-engine-2.14.1` 目录只是空 PyPI 元包，不能加入 `PYTHONPATH`。Ascend 路径由 NPU 可见时的 MindSpeed adaptor 注入；元包归档只保留作来源审计。
 
 冻结哈希：
@@ -226,13 +231,57 @@ verified RPO 相对 matched continued-SFT：
 交接协议：
 
 1. 5 号机每个训练条件只输出 LoRA adapter、`args.json`、输入哈希和训练日志。
-2. 每个 checkpoint 计算 SHA256，经本地中转到 6 号机；5→6 直连未授权，不修改服务器 SSH 信任关系。
-3. 6 号机用同一个 base、同一 vLLM 镜像和完全一致的采样/缓存/超时参数加载不同 adapter。
-4. 首先用单个 TP8 实例做 LoRA 兼容性与输出 smoke；通过后可启用两个 TP8 副本并行 rollout。
-5. 双副本评测时，task ID 到副本的分片固定；所有模型条件使用同一映射，避免副本差异混入模型差异。
-6. base、chosen-SFT、continued-SFT、DPO、RPO、randomized-RPO 均在同一套 v21 internal heldout 上评测；最终结论另需全新 PI heldout。
+2. 每个 checkpoint 计算 SHA256，由 5 号机通过内网 `192.168.202.5 → 192.168.202.4` 直接 `rsync/SSH` 到 6 号 `.incoming`；Windows 不进入数据链路。
+3. 6 号逐包和逐文件校验，通过后在同一文件系统内原子发布到 `adapters/`，禁止覆盖同名产物。
+4. 6 号机用同一个 base、同一 `llin-*` 推理镜像和完全一致的采样/缓存/超时参数评测不同条件。
+5. 离线 DPO/RPO checkpoint 默认先合并 LoRA 再评测；静态 PEFT LoRA 只有通过语义 smoke 后才可启用。在线 GRPO 可复用老板已验证的动态 LoRA 共享文件同步。
+6. 首先用单个 TP8 实例做模型注册、HTTP 请求和输出语义 smoke；通过后可启用两个 TP8 副本并行 rollout。
+7. 双副本评测时，task ID 到副本的分片固定；所有模型条件使用同一映射，避免副本差异混入模型差异。
+8. base、chosen-SFT、continued-SFT、DPO、RPO、randomized-RPO 均在同一套 v21 internal heldout 上评测；最终结论另需全新 PI heldout。
 
 结论：
 
 - 训练与推理解耦是当前推荐架构，能消除训练/rollout 的 NPU 竞争，并把推理环境固定为单一版本。
 - 该决策不改变 E-002 的权限门槛：5 号机 MindSpeed 26 训练仍需明确授权 privileged 容器。
+
+### 2026-07-28：E-004 业界架构复核与 5→6 工程联调
+
+业界架构复核：
+
+- [TRL DPO Trainer](https://huggingface.co/docs/trl/dpo_trainer) 和 [NeMo RL DPO](https://docs.nvidia.com/nemo/rl/latest/guides/dpo.html) 都将 DPO 定义为冻结偏好数据上的离线优化；训练期间不需要一台在线推理机持续生成样本。
+- 因此本项目的 `5 号训练 + 6 号推理/评测` 是训练/评测解耦，不是两机共同执行一个 DPO optimizer。
+- 真正的多节点训练应按 [PyTorch Distributed](https://docs.pytorch.org/docs/stable/distributed) 让多节点进入同一个 HCCL/NCCL distributed world，并由统一 launcher/scheduler 管理 rank、故障和 rendezvous。
+- 在线 GRPO/PPO 才适合将 trainer 与 rollout worker 解耦；[OpenRLHF](https://github.com/OpenRLHF/OpenRLHF) 和 [NeMo RL](https://docs.nvidia.com/nemo/rl/latest/index.html) 都采用框架管理的推理 worker、权重同步和调度，不使用个人电脑搬运 checkpoint。
+
+本次实际更新：
+
+- 新增 `scripts/publish_adapter_5_to_6.sh`，固化 5 号到 6 号的内网直传、相对路径 SHA256、`.incoming` 校验和原子发布；Windows 只发送控制命令。
+- 5 号复用 chosen-SFT `checkpoint-75` 作为工程载荷，经内网直接传输到 6 号：
+  - 传输字节：`233,694,155`
+  - 观测吞吐：约 `155 MB/s`
+  - tar SHA256：`6ca1a7cb3555104dab3d6607e1384cccef10303de9b5cc5ee661e6ee840f2ca8`
+  - `adapter_config.json`：`66813c837dfbca64f0c86f190df7f0e9c011d52434e329a83ea0240f7957048a`
+  - `adapter_model.safetensors`：`bcb7493f70519e89460ef9283616ee9e3cd6268dc0b3a7eabf0e975711bd42fa`
+- 6 号完成逐包、逐文件校验并原子发布；未通过 Windows、HTTP 服务或第三方机器传输模型。
+- 全程只复用用户自己的：
+  - container：`llin-qwen36-grpo-pi-rollout-priv-host-0727`
+  - image：`llin-vllm-ascend:grpo-pi-deps-20260727`
+  未新建容器/镜像，未使用其他人的资源。
+- 新增 `scripts/run_p001_vllm_smoke_inner.sh` 和固定请求 JSON，完成 TP8、vLLM 0.23.0、8K 工程启动：
+  - `/v1/models` HTTP 200；
+  - base 与 adapter 均成功注册；
+  - base Chat Completions HTTP 200 且输出语义连贯。
+- 静态 PEFT LoRA 路径发现两层兼容问题：
+  1. `all-linear` 会命中 Qwen3.6 GDN `in_proj_ba`，触发 NPU Punica `hidden in should be smaller than hidden out`；
+  2. 即使复用老板兼容补丁、过滤不支持张量，旧 chosen-SFT 和老板原生 GRPO checkpoint-20 都输出连续 `!`，虽然接口返回 200。
+- 老板 GRPO 原运行的动态 rollout 轨迹正常，包含多轮 Bash 工具调用；20 步日志 reward 从 `0.25` 到 `0.36812499`。因此 checkpoint 与基座并非天然只会输出 `!`，失败边界在静态 PEFT LoRA serving 路径。
+- `scripts/filter_qwen36_vllm_lora.py` 仅保留为诊断复现工具，不作为正式评测产物生成器。
+- 将 `scripts/run_p001_megatron_inner.sh` 的 LoRA target 从 `all-linear` 修正为老板已验证的 `linear_qkv linear_fc1`，避免训练出当前 rollout 不支持的 GDN adapter。
+- 所有冒烟 vLLM 进程已停止；6 号 16 张 NPU AICore 均回到 0。
+
+结论：
+
+- 多机控制面、5→6 服务器内网数据面、校验、原子发布、6 号 TP8 基座推理均已跑通。
+- 静态 LoRA 虽“能加载、能返回 200”，但未通过语义门槛，不能记为完整闭环成功。
+- P-001 的正式离线 DPO/RPO 采用“5 号训练 → 内网发布 → LoRA 合并 → 6 号冻结评测”；若后续做在线 GRPO，则直接复用老板已验证的动态 adapter 同步，不自建临时 HTTP/Windows 中转。
+- 剩余工程门槛是：在 5 号仅使用 `llin-*` 资源启动可见 NPU 的训练容器，并完成 1-step checkpoint；随后在 6 号验证合并产物的语义输出。

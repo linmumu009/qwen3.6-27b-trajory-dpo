@@ -1,0 +1,11 @@
+{
+  "model": "Qwen3.6-27B",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply with exactly: P001_MULTIHOST_OK"
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 32
+}

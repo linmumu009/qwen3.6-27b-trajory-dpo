@@ -1,0 +1,11 @@
+{
+  "model": "boss-grpo-ckpt20",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Reply with exactly: P001_MULTIHOST_OK"
+    }
+  ],
+  "temperature": 0,
+  "max_tokens": 64
+}

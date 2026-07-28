@@ -73,6 +73,7 @@ export TORCH_HCCL_HEARTBEAT_TIMEOUT_SEC=7200
   printf 'learning_rate=%s\nseed=%s\n' "${LEARNING_RATE}" "${SEED}"
   printf 'dataset_shuffle=false\ntrain_dataloader_shuffle=false\n'
   printf 'lora_rank=8\nlora_alpha=32\n'
+  printf 'lora_target_modules=linear_qkv,linear_fc1\n'
   printf 'dpo_beta=0.1\n'
   if [[ "${STAGE}" == "rpo" || "${STAGE}" == "randomized_rpo" ]]; then
     printf 'rpo_alpha=1.0\n'
@@ -96,7 +97,7 @@ common_args=(
   --context_parallel_size 2
   --sequence_parallel true
   --tuner_type lora
-  --target_modules all-linear
+  --target_modules linear_qkv linear_fc1
   --lora_rank 8
   --lora_alpha 32
   --lora_dropout 0
