@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+cd /workspace/p001
+
 STAGE="${STAGE:?set STAGE to sft, continued_sft, dpo, rpo, or randomized_rpo}"
 DATASET="${DATASET:?set DATASET to a container-visible JSONL path}"
 OUTPUT_DIR="${OUTPUT_DIR:?set OUTPUT_DIR to a container-visible output directory}"

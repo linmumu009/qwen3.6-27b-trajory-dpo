@@ -148,8 +148,9 @@ verified RPO 相对 matched continued-SFT：
   - 支持 base PI-SFT、continued-SFT、DPO、RPO、randomized-RPO；
   - 固定 `TP8 × PP1 × CP2 × SP`、40K、LoRA r8/alpha32；
   - 对每次 run 保存环境版本、输入哈希、NPU 前后状态和退出码。
-- 新增 `scripts/create_p001_container.sh`。安全审查后采用最小权限方案：非 privileged、bridge 网络、独立 64GB shared memory，仅显式映射 16 张 NPU 与必要 Ascend 管理设备；不挂载整块 `/data3`。
+- 新增 `scripts/create_p001_container.sh`，默认使用非 privileged、host network/IPC，仅显式映射 16 张 NPU 与必要 Ascend 管理设备；不挂载整块 `/data3`。
 - 已将 6 号机约 65MB 的压缩运行补丁包和冻结数据安全中转到 Git 忽略目录；未搬运 18.7GB 整镜像。
+- 首次容器 import 自检定位到两个隐含条件：容器工作目录必须避开基座自带 Megatron；且 `transformer-engine-2.14.1` 目录只是空 PyPI 元包，不能加入 `PYTHONPATH`。Ascend 路径由 NPU 可见时的 MindSpeed adaptor 注入；元包归档只保留作来源审计。
 
 冻结哈希：
 
@@ -162,8 +163,42 @@ verified RPO 相对 matched continued-SFT：
 | P-001 randomized preference（101） | `da62b39d532ee13ebf6b32683965e71f6e8d8619d97d3b05173e0e34af038695` |
 | P-001 internal heldout tasks（40） | `ecd6dfd35ee8d29af475bcc33566186bc0b4c888e0e5c585f300de4c5ac4c99e` |
 | 运行补丁归档 | `fe77cad7a3068257e5f51f1ec5901b29d41dc4bd86f3f5eeba05df0ad15aff10` |
+| transformer-engine 补丁归档 | `62fdd248d89da3cff3b1ef50a1b6a4d892634424d1da52a7992728b39067070f` |
 
 结论：
 
 - P-001 的训练/内部 heldout 已冻结，可进入 5 号机 40K worst1 烟测。
 - v21 属于严格未参与训练的内部 heldout，但团队已经接触过该版本，不能代替最终的全新 PI 任务集；它适合 pilot 选型，不足以单独支撑对外泛化结论。
+
+### 2026-07-28：E-002 5 号机最小权限容器自检
+
+更新内容：
+
+- 在 5 号机本地 `mindspeed-llm:26.0.0-a3-sshd-yehairui` 基座上成功构建 P-001 镜像：
+  - image ID：`sha256:20f3fc105341b6e13ed3a232aed1a87eac2b58cca44d47dc5174e99526dbcbc4`
+  - Python：3.11
+  - Transformers：5.12.1
+  - Swift：4.5.0.dev0
+- 为避免扩大宿主权限，依次测试三种非 privileged 配置：
+  1. bridge network + private IPC + 19 个显式 Ascend 设备；
+  2. bridge network + host IPC + 19 个显式 Ascend 设备；
+  3. host network + host IPC + 19 个显式 Ascend 设备，并设置完整 physical/visible device IDs。
+- 三种配置均返回：
+  - `torch.npu.device_count() == 0`
+  - `torch.npu.is_available() == False`
+  - DCMI：`device is used, ret=-8020`
+- 对照检查显示，同机 `slime-qwen35-rl-dev` 在非 privileged 模式可见 16 卡；而本机 MindSpeed 26 系列现有可见 NPU 的容器均为 privileged。故障边界位于 MindSpeed 26 基座与本机 Ascend runtime/driver 的权限组合，不是 P-001 数据或 trainer 参数。
+- 已确认旧 DPO 训练有 `TRAINING_COMPLETE` 标记，并受控停止：
+  - `llin-rl-dpo-p2-formal-0-3`
+  - `llin-rl-dpo-p2-formal-4-15`
+  它们没有被删除，可随时恢复。
+- 停止后宿主 `npu-smi` 显示 16 张卡 AICore 均为 0，且没有 NPU 进程。
+- 自检失败的 `llin-qwen36-p001-megatron` 也已停止；镜像、容器定义、冻结数据和运行目录均保留。
+
+结论：
+
+- 5 号机资源确实空闲，但当前安全的非 privileged 容器无法使用这套 MindSpeed 26 运行层。
+- 下一步需要二选一的明确授权：
+  1. 在 5 号机创建 privileged P-001 容器，但仍只挂载 P-001 工作目录、只读模型与必要 Ascend 路径，不挂 Docker socket、不挂整块数据盘；
+  2. 改在 6 号机已经验证的 privileged 长上下文容器中执行 smoke/pilot。
+- 在获得选择前不启动训练，也不把“能 import/能起容器”误记为 smoke 通过。

@@ -43,10 +43,14 @@ done
 docker run -d \
   --name "${CONTAINER}" \
   --shm-size 64g \
+  --ipc host \
+  --network host \
+  --workdir /workspace/p001 \
   -e HCCL_CONNECT_TIMEOUT=1800 \
   -e TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
   -e ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
   -e ASCEND_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
+  -e PHYSICAL_NPU_DEVICE_IDS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 \
   "${mount_args[@]}" \
   "${IMAGE}" \
   bash -lc 'sleep infinity'
