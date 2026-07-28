@@ -202,3 +202,37 @@ verified RPO 相对 matched continued-SFT：
   1. 在 5 号机创建 privileged P-001 容器，但仍只挂载 P-001 工作目录、只读模型与必要 Ascend 路径，不挂 Docker socket、不挂整块数据盘；
   2. 改在 6 号机已经验证的 privileged 长上下文容器中执行 smoke/pilot。
 - 在获得选择前不启动训练，也不把“能 import/能起容器”误记为 smoke 通过。
+
+### 2026-07-28：E-003 训练/推理解耦方案
+
+决策：
+
+- 5 号机专用于 P-001 训练。
+- 6 号机专用于 checkpoint 推理、PI agent rollout 和 heldout 评测。
+
+核实结果：
+
+- 两台机器的 16 张 NPU 均为 AICore 0%，无 NPU 进程。
+- 6 号机已有多个 Qwen3.6 rollout/GRPO 容器，但当前都只运行 `sleep infinity`。
+- 6 号机已有 Qwen3.6-27B base（约 52GB）和 PI sandbox 挂载。
+- 已验证的 rollout 镜像：
+  - image：`llin-vllm-ascend:grpo-pi-deps-20260727`
+  - vLLM：0.23.0
+  - Torch：2.10.0
+  - 单容器可见 8 张 NPU
+  - 支持 `--enable-lora`、`--lora-modules`、LoRA rank 8 和 tensor parallel
+- 6 号机 8000-8015 当前无监听服务，可冻结独立评测端口。
+
+交接协议：
+
+1. 5 号机每个训练条件只输出 LoRA adapter、`args.json`、输入哈希和训练日志。
+2. 每个 checkpoint 计算 SHA256，经本地中转到 6 号机；5→6 直连未授权，不修改服务器 SSH 信任关系。
+3. 6 号机用同一个 base、同一 vLLM 镜像和完全一致的采样/缓存/超时参数加载不同 adapter。
+4. 首先用单个 TP8 实例做 LoRA 兼容性与输出 smoke；通过后可启用两个 TP8 副本并行 rollout。
+5. 双副本评测时，task ID 到副本的分片固定；所有模型条件使用同一映射，避免副本差异混入模型差异。
+6. base、chosen-SFT、continued-SFT、DPO、RPO、randomized-RPO 均在同一套 v21 internal heldout 上评测；最终结论另需全新 PI heldout。
+
+结论：
+
+- 训练与推理解耦是当前推荐架构，能消除训练/rollout 的 NPU 竞争，并把推理环境固定为单一版本。
+- 该决策不改变 E-002 的权限门槛：5 号机 MindSpeed 26 训练仍需明确授权 privileged 容器。
