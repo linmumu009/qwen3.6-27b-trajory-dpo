@@ -1,0 +1,20 @@
+# Never publish server access material.
+SSH_PRIVATE_KEY_LOGIN_*.md
+
+# Internal reports may contain server paths, prompts, and embedded evidence.
+缓存命中实验报告/
+长上下文实验报告/
+
+# Local runtime and generated artifacts.
+.env
+.env.*
+!.env.example
+artifacts/
+logs/
+runs/
+outputs/
+checkpoints/
+__pycache__/
+*.pyc
+.pytest_cache/
+
