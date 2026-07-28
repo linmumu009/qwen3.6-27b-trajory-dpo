@@ -34,7 +34,7 @@ verified RPO 相对 matched continued-SFT：
 
 因此下一轮以 **chosen-SFT warm start + verified RPO** 为主线；普通 DPO保留为对照，不作为默认训练目标。
 
-多机工程方面，5→6 内网 checkpoint 直传、校验和原子发布已通过；6 号基座推理已通过。当前仍不能宣告完整训练/评测闭环通过：vLLM-Ascend 0.23 的静态 PEFT LoRA 路径虽能注册 adapter，但在两个真实 checkpoint 上均产生重复感叹号，不能作为质量验收路径。P-001 将改用训练后 LoRA 合并模型进行离线评测，或复用老板已验证的动态 LoRA 同步链路。
+多机工程方面，`5 号训练 + 6 号在线 rollout` 的同步 GRPO 单步闭环已经通过：初始 LoRA 由 5 号直接 rsync 到 6 号，经过 SHA256、版本目录和原子 symlink 发布，6 号 8 个 worker 全部确认加载；随后完成 8 条在线 PI agent 轨迹、reward、反向更新和 checkpoint-1。该 smoke 的 8 条 reward 全为 `0.3`、advantage 全为 `0`，所以只能证明工程闭环，不能证明模型效果提升。下一阶段首先测量 20 个 prompt 的组内 reward 方差并修正 verifier/采样，再做有学习信号的 pilot。
 
 ## 已核实资产
 
@@ -50,7 +50,7 @@ verified RPO 相对 matched continued-SFT：
 - 同任务还有 Qwen3.7-Max、DeepSeek-v4-Pro、GLM-5.2 轨迹和 verdict。
 - 四模型在 1500 个共同任务上可形成 871 个严格序偏好任务；其中 669 个满足 `partial/correct > incorrect/incomplete` 的强分离。
 - 现有 DPO/RPO 工程位于服务器项目 `llin-rl-dpo-p2`。
-- 16 张 NPU 当前 AICore 均为 0%，但 DPO 容器仍运行 NPU 显存保留进程；正式实验前需受控释放。
+- 16 张 NPU 当前 AICore 均为 0%，没有 NPU 进程；已完成的旧 DPO 容器和本次 GRPO trainer 均处于停止状态。
 
 ### 6 号机
 
@@ -285,3 +285,115 @@ verified RPO 相对 matched continued-SFT：
 - 静态 LoRA 虽“能加载、能返回 200”，但未通过语义门槛，不能记为完整闭环成功。
 - P-001 的正式离线 DPO/RPO 采用“5 号训练 → 内网发布 → LoRA 合并 → 6 号冻结评测”；若后续做在线 GRPO，则直接复用老板已验证的动态 adapter 同步，不自建临时 HTTP/Windows 中转。
 - 剩余工程门槛是：在 5 号仅使用 `llin-*` 资源启动可见 NPU 的训练容器，并完成 1-step checkpoint；随后在 6 号验证合并产物的语义输出。
+
+### 2026-07-28：E-005 5 号训练 + 6 号 rollout 的同步在线 GRPO 单步闭环
+
+架构决策：
+
+- 初始阶段采用同步 on-policy GRPO：每一步先发布确定版本的 LoRA，等待所有 rollout worker 确认，再生成轨迹、计算 reward 和更新 trainer。
+- 该选择与 [NeMo RL GRPO](https://docs.nvidia.com/nemo/rl/latest/guides/grpo.html) 的同步 worker 设计一致；异步模式需要额外处理权重版本年龄和 off-policy 修正，留到同步基线稳定后再评估。[NeMo RL Async GRPO](https://docs.nvidia.com/nemo/rl/latest/guides/async-grpo.html) 也明确区分 rollout 与 trainer 的权重滞后。
+- Windows 只发送 SSH 控制命令。模型、LoRA、轨迹和 checkpoint 均不经过 Windows。
+- 5→6 数据面使用服务器内网 `192.168.202.5 → 192.168.202.4` 的 SSH/rsync；6 号 rollout 仅监听 `127.0.0.1:28220/28221`，5 号通过 SSH local forward 访问。
+- 全程只使用或创建 `llin-*` 镜像和容器。
+
+工程更新：
+
+- 新增 `scripts/transfer_grpo_image_6_to_5.sh`，由 5 号直接拉取 6 号 trainer image，不经过 Windows。
+- 新增 `scripts/create_p001_online_grpo_trainer_5.sh`，只接受 `llin-*` image；创建 privileged、host network/IPC 的 trainer，但不挂 Docker socket、不挂整块 `/data3`，只挂：
+  - 必要 Ascend driver/管理文件（只读）；
+  - Qwen3.6-27B base（只读）；
+  - 本项目 reference（只读）；
+  - 本次 `online_grpo` run 根目录（读写）。
+- 新增 `scripts/cross_host_lora_sync_patch.py`：
+  - trainer 将扁平 LoRA 保存为 `llin-ms-swift-flat-lora-v1`；
+  - 记录 tensor 数、字节、SHA256 和唯一 `transfer_id`；
+  - 等待服务器间 watcher ACK 后，才调用 rollout 的 adapter update endpoint；
+  - 必须收到 `all_workers_loaded=true` 才允许生成轨迹。
+- 新增 `scripts/watch_cross_host_lora_sync.sh`：
+  - 5 号宿主直接 rsync 到 6 号 `.incoming`；
+  - 在 6 号复算 SHA256/字节；
+  - 发布为不可变 `versions/adapter-<transfer_id>-<sha>.pt`；
+  - 原子替换 `adapter_flattened.pt` symlink；
+  - 向 5 号写回版本化 ACK。
+- 新增 `scripts/server_mode_no_local_vllm_patch.py`。5 号 trainer 只使用远端 HTTP client，不安装或执行第二套本地 vLLM/CANN；老板已有 shared-file patch 负责禁用 trainer 本地 HCCL communicator。
+- 新增 `scripts/run_p001_online_grpo_train_inner.sh`、`scripts/run_p001_online_grpo_train_host_5.sh` 和 `scripts/start_p001_crosshost_grpo_5.sh`，固化：
+  - trainer：`TP4 × PP1 × CP2 × SP`，8 张 NPU；
+  - rollout：`TP4 × DP2`，8 张 NPU；
+  - LoRA：rank 4、alpha 16、target `linear_qkv linear_fc1`；
+  - `num_generations=8`、`generation_batch_size=8`；
+  - smoke：总上下文 4096、completion budget 2048、1 step。
+- 新增 `scripts/summarize_online_grpo_run.py`，在服务器就地汇总轨迹字段、reward/advantage、训练指标、checkpoint hash 和 safetensors finite 检查，不打印轨迹正文。
+
+运行环境与兼容边界：
+
+- 6 号老板 trainer image `llin-rl-grpo:pi-deps-20260727` 已由 5 号直拉，前后 image ID 完全一致：
+  - `sha256:5b52febafc54df86cbaae7f6caa5e47da205cecba44217167d0f836754cf5c90`
+  - `20,141,205,429` bytes
+- 该 6 号 image 在 5 号直接运行时出现 CANN/driver ABI undefined symbol，不能复用为 5 号正式 trainer。
+- 5 号新构建的 `llin-qwen36-p001-megatron:20260728` 可见 8 卡，但其 `triton-ascend 3.2.0` 与 5 号 CANN header 不兼容；失败镜像和容器保留审计，未删除。
+- 最终复用 5 号已经完成 DPO 训练的自有基座 `llin-rl-dpo-p2-base:20260707`。它的 MindSpeed 导入与 GRPO Python 依赖均通过，最终 trainer container 为：
+  - `llin-qwen36-grpo-trainer-m05-p001-dpo-base`
+- 6 号 rollout container 为：
+  - `llin-qwen36-grpo-pi-rollout-priv-host-0727`
+
+失败迭代：
+
+| run | 失败边界 | 处理 |
+|---|---|---|
+| r1 | 5 号新镜像找不到 `ccec`，补 PATH 后又暴露 Triton/CANN header 不兼容 | 改用 5 号已验证的自有 DPO 基座 |
+| r2 | server mode 仍被 Swift trainer 的“本地 vLLM 必须存在”检查阻止 | 增加 trainer-only remote-vLLM patch |
+| r3 | 通用 RLHF guard 已覆盖，但 Megatron trainer 还有第二层同名 guard | 对两个模块都做显式 server-mode patch 和模块级断言 |
+| r4 | 成功 | 完成同步、8 条轨迹、reward、反向更新和 checkpoint |
+
+r4 工程证据：
+
+- run：`p001_crosshost_grpo_1step_20260728_r4`
+- 初始 LoRA：
+  - tensor 数：`408`
+  - bytes：`28,186,699`
+  - SHA256：`224c2eb37844d6dbe8a260c7b72de6270f49691b1182ec050f83b210757a725e`
+  - 5 号 request 到 6 号 ACK：约 2 秒
+  - 5、6 号复算 SHA256 完全一致
+  - 6 号 8 个 worker 均写出 `adapter_loaded`；server 返回 `all_workers_loaded=true`
+- rollout：
+  - `8/8` 轨迹完成，`/infer/` HTTP 200
+  - 单次 8 样本生成约 42 秒
+  - `completions.jsonl`：`74,810` bytes
+  - SHA256：`da54df7488c603e7f19a899f4b85ac3e773ea5358e2e563c839f847f3feb6a34`
+- trainer：
+  - exit code：`0`
+  - step：`1/1`
+  - loss：`4.62e-06`
+  - KL：`1.1551e-4`
+  - grad norm：`1.08709e-3`
+  - learning rate：`1e-6`
+  - trainer step：约 `261.48s`
+  - NPU memory：约 `16.02GiB`
+- checkpoint：
+  - `checkpoint-1/latest_checkpointed_iteration.txt == 1`
+  - 同时保存 8-rank Megatron distributed checkpoint 和 LoRA safetensors
+  - `adapter_model.safetensors`：`28,181,384` bytes
+  - SHA256：`f2341828039feb34c719f1c2d14832ddf8079d74f248843a17789f29e42f5936`
+  - 408 个 adapter tensor 全部可读且 finite
+
+质量结论：
+
+- 8 条 `PiAgentTrajectoryORM` reward 均为 `0.3000000119`，reward std 为 `0`。
+- 8 条 advantage 均为 `0`，`frac_reward_zero_std=1.0`。
+- 非零 loss/grad 说明完整训练代码路径执行了，但本 batch 没有 GRPO 组内排序信号；本实验不得记为“模型效果提升”。
+- 当前工程已经足够进入 reward-signal pilot，但还不足以直接长跑在线 GRPO。
+
+下一步：
+
+1. 固定当前 r4 工程栈，先对 20 个唯一 prompt 各采样 8 条，仅做 rollout/verifier audit，不更新模型。
+2. 逐 prompt 统计 reward 分布、成功类型、工具调用失败类型和 completion budget 命中率；将 `reward_std=0` 的原因区分为任务过易、任务过难、verifier 过粗和采样同质化。
+3. 优先修 verifier 的组内区分度，再调温度/采样；不通过单纯扩大训练步数掩盖零 advantage。
+4. 选择有非零组内方差且 verifier 可信的 prompt 组成小型 pilot；加入固定 base/chosen-SFT/continued-SFT/verified-RPO 对照。
+5. pilot 通过后再考虑异步 GRPO；异步必须记录 weight version/age，并设置最大可接受陈旧度，不能直接复用同步结果做质量结论。
+
+资源状态：
+
+- r4 完成后已停止 5 号 trainer、SSH tunnel 和 LoRA watcher。
+- 6 号 rollout container 已重启回空闲主进程，28220/28221 无监听。
+- 5 号意外重新启动的已完成旧 DPO 容器 `llin-rl-dpo-p2-formal-0-3` 已再次停止。
+- 5、6 号 `npu-smi` 均显示无 NPU 进程；所有失败 run、成功 run、镜像、容器定义和 checkpoint 均保留。
