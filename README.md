@@ -34,7 +34,7 @@ verified RPO 相对 matched continued-SFT：
 
 因此下一轮以 **chosen-SFT warm start + verified RPO** 为主线；普通 DPO保留为对照，不作为默认训练目标。
 
-多机工程方面，`5 号训练 + 6 号在线 rollout` 的同步 GRPO 单步闭环已经通过：初始 LoRA 由 5 号直接 rsync 到 6 号，经过 SHA256、版本目录和原子 symlink 发布，6 号 8 个 worker 全部确认加载；随后完成 8 条在线 PI agent 轨迹、reward、反向更新和 checkpoint-1。该 smoke 的 8 条 reward 全为 `0.3`、advantage 全为 `0`，所以只能证明工程闭环，不能证明模型效果提升。下一阶段首先测量 20 个 prompt 的组内 reward 方差并修正 verifier/采样，再做有学习信号的 pilot。
+多机工程方面，`5 号训练 + 6 号在线 rollout` 的同步 GRPO 单步闭环已经通过：初始 LoRA 由 5 号直接 rsync 到 6 号，经过 SHA256、版本目录和原子 symlink 发布，6 号 8 个 worker 全部确认加载；随后完成 8 条在线 PI agent 轨迹、reward、反向更新和 checkpoint-1。该 smoke 的 8 条 reward 全为 `0.3`、advantage 全为 `0`，所以只能证明工程闭环，不能证明模型效果提升。后续 reward-signal audit 在用户停止前完成 17/20 个 prompt、共 136 条轨迹，其中 16 组存在非零 reward 方差；但 66.9% 轨迹命中总 token 上限，reward 仍大量集中在 `0.3`。因此下一阶段应先审查 verifier 分量和候选 prompt，不直接开始长跑训练。
 
 ## 已核实资产
 
@@ -75,7 +75,7 @@ verified RPO 相对 matched continued-SFT：
 
 ## 下一轮实验：P-001 轨迹 RPO pilot
 
-状态：`data-frozen / multihost-data-plane-passed / training-runtime-gated`
+状态：`data-frozen / multihost-data-plane-passed / partial-reward-signal-audited / training-runtime-gated`
 
 ### 目标
 
@@ -397,3 +397,81 @@ r4 工程证据：
 - 6 号 rollout container 已重启回空闲主进程，28220/28221 无监听。
 - 5 号意外重新启动的已完成旧 DPO 容器 `llin-rl-dpo-p2-formal-0-3` 已再次停止。
 - 5、6 号 `npu-smi` 均显示无 NPU 进程；所有失败 run、成功 run、镜像、容器定义和 checkpoint 均保留。
+
+### 2026-07-28：E-006 在线 GRPO reward-signal audit（用户停止，保留 17/20 组）
+
+目标与约束：
+
+- 固定 E-005 r4 的初始策略，仅在 6 号做在线 rollout/verifier audit；不启动 5 号 trainer、不执行 optimizer step、不更新权重。
+- 计划对 20 个唯一 prompt 各采样 8 条，以组内 reward 方差判断是否存在 GRPO 排序信号。
+- Windows 仍只发送 SSH 控制命令；轨迹正文、模型和 checkpoint 均留在服务器。
+- 全程只使用自有容器 `llin-qwen36-grpo-pi-rollout-priv-host-0727` 和 `llin-*` image。
+
+工程更新：
+
+- 新增 `scripts/audit_online_grpo_reward_signal.py`：
+  - 按 prompt 原子写入 8 条完整 group，支持断点跳过；
+  - 将数据集元数据通过 rollout API 的 `data_dict` 透传；
+  - 记录 reward 分量、停止原因、工具失败、token budget 和轨迹 SHA256；
+  - 支持 `--start-prompt` / `--end-prompt` 分片，只有完整 20 组才写正式 summary。
+- 新增 `scripts/load_shared_lora_adapter.py`，在采样前校验共享 LoRA 的 SHA256，并要求 8 个 rollout worker 全部报告 `adapter_loaded`。
+- 新增 `scripts/run_p001_reward_signal_audit_6.sh`，固化自有容器检查、r4 LoRA 精确复制、服务健康检查、脱敏环境证据和退出时资源清理。
+- 新增 `scripts/summarize_partial_reward_audit.py`，只汇总已完成 group 的统计量与文件哈希，不输出轨迹正文。
+- 新增 `tests/test_reward_signal_audit.py`，覆盖 `data_dict` 透传、零/非零方差诊断和“audit 不授权训练”的门禁。
+
+运行记录：
+
+| run | 结果 | 说明 |
+|---|---|---|
+| `p001_reward_signal_audit_20x8_20260728_r1` | 失败并自动释放资源 | rollout 总上下文为 4096；首个 prompt 中一条输入已达 4460 token，剩余 completion budget 变成负数并触发 HTTP 500。未生成有效 group，未更新权重。 |
+| `p001_reward_signal_audit_20x8_20260728_r2` | 用户停止，保留 17/20 组 | 将总上下文提高到 8192，同时保持 completion budget 2048；完成 prompt 0–16，共 136 条轨迹。未更新权重。 |
+
+r2 冻结证据：
+
+- 策略沿用 E-005 r4 LoRA：
+  - bytes：`28,186,699`
+  - tensor 数：`408`
+  - SHA256：`224c2eb37844d6dbe8a260c7b72de6270f49691b1182ec050f83b210757a725e`
+  - 8 个 worker 全部确认加载，`all_workers_loaded=true`
+- 数据 SHA256：`e819848b0cdde6f69bdfb08537060e02bcf6d95ea64a8f7d212539517dfc6b57`
+- verifier manifest SHA256：`e4269e118605c24773cfe749d479cc8cbdb637dd23fd277895d18e70233652ee`
+- reward plugin SHA256：`23f27019d93f31af4a30592a3c29522bc18201cfbb700538d50d733399cc00bd`
+- 为缩短 wall time，主进程完成 prompt 0–9，额外分片完成 prompt 10–16；在 prompt 17 写文件前主动停止额外分片，避免两个进程竞争同一 group 文件。
+- 用户发出停止指令后立即停止剩余采样；prompt 17–19 没有被记为完整 group，也没有伪造 20/20 summary。
+
+17 组脱敏汇总：
+
+| 指标 | 结果 |
+|---|---:|
+| 完整 prompt group | 17 |
+| 完整轨迹 | 136 |
+| reward 均值 / 中位数 | 0.3346 / 0.3 |
+| reward 计数 | `0.0: 19`、`0.3: 90`、`0.5: 17`、`1.0: 10` |
+| 非零组内方差 | 16/17 |
+| 零方差 prompt | index 16，8 条均为 `0.3` |
+| 命中总 token 上限 | 91/136（66.9%） |
+| 停止原因 | `total_token_limit: 91`、`final_answer: 44`、`max_turns: 1` |
+| 单条耗时 | 中位数 66.70s，均值 120.70s，最大 582.29s |
+| 工具调用次数 | 中位数 4，均值 4.95，最大 15 |
+
+信号判断：
+
+- prompt index 2、10、11 同时出现 `0.0` 和 `1.0`，是首批值得人工核验的高区分度候选。
+- index 5、6、7、8、14 的方差较弱；index 16 完全零方差。它们需要区分 verifier 过粗、任务难度、采样同质化和 token 截断，不宜直接混入训练。
+- 136 条中 `queried_required_tables=true` 为 38，`gold_evidence=true` 为 12；说明当前高分信号稀疏。
+- 工具失败事件以 `command_not_found: 137`、`policy_blocked: 27`、`execution_error: 26`、`missing_file: 22` 为主。一次轨迹可包含多个失败事件，因此这些计数不能直接当作轨迹失败率。
+- rollout 返回的 `generated_tokens` 字段在 136 条中均为 0，而 `tool_response_tokens` 中位数为 1984；该字段口径需要在正式训练前核实，当前只使用停止原因和总 budget 命中判断截断。
+- 本次结果证明 17 个已完成 prompt 中存在 GRPO 组内排序信号，但不证明 verifier 已可信，更不证明模型效果提升；`quality_claims_allowed=false`、`policy_update_performed=false`。
+
+停止与资源状态：
+
+- 用户停止后，6 号 rollout container 已重启回只运行 `sleep infinity`，没有 rollout 服务。
+- 5 号 trainer container 保持退出状态。
+- 最终复核 5、6 号 `npu-smi`：所有可见 NPU 的 AICore 为 0%，均显示 `No running processes found`。
+- 17 个完整 group 和脱敏 `partial_summary.json` 留在 6 号服务器，未传到 Windows；后续不会自动续跑。
+
+下一次只有在用户明确恢复实验后才执行：
+
+1. 人工复核 index 2、10、11 的 reward 分量与轨迹正确性，并抽查 0.3 大量聚集是否为合理 verifier 判定。
+2. 修正或确认 token 统计口径，降低 66.9% 的 budget hit，再冻结候选 prompt。
+3. 只对 verifier 可信且组内方差非零的 prompt 做小型在线 GRPO pilot，并保留 base/chosen-SFT/continued-SFT 对照；不得由本次 audit 自动授权训练。
