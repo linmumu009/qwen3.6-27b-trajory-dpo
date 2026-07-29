@@ -13,13 +13,19 @@ R4_RUN_DIR="${ROOT}/runs/p001_crosshost_grpo_1step_20260728_r4"
 R4_LORA_SHA256=224c2eb37844d6dbe8a260c7b72de6270f49691b1182ec050f83b210757a725e
 CONTAINER=llin-qwen36-grpo-pi-rollout-priv-host-0727
 HTTP_PORT=28220
-MAX_MODEL_LEN=8192
-COMPLETION_BUDGET=2048
+MAX_MODEL_LEN="${PI_AGENT_MAX_MODEL_LEN:-8192}"
+COMPLETION_BUDGET="${PI_AGENT_COMPLETION_BUDGET:-2048}"
 DATASET=/workspace/grpo_run/shared/datasets/train_20_unique_prompts.jsonl
 VERIFIER_MANIFEST=/workspace/pi_rl/data/processed/strong_verified_27/verifier_manifest.jsonl
 PLUGIN=/workspace/grpo_run/shared/pi_agent_grpo_plugin.py
 AUDIT_SCRIPT=/workspace/grpo_run/shared/audit_online_grpo_reward_signal.py
 LOAD_SCRIPT=/workspace/grpo_run/shared/load_shared_lora_adapter.py
+PARTIAL_SUMMARY_SCRIPT=/workspace/grpo_run/shared/summarize_partial_reward_audit.py
+ROLLOUT_INNER="${PI_AGENT_ROLLOUT_INNER:-/workspace/grpo_run/shared/run_qwen36_grpo_pi_rollout_inner.sh}"
+REWARD_CONTRACT="${PI_AGENT_REWARD_CONTRACT:-v1}"
+AUDIT_START_PROMPT="${PI_AGENT_AUDIT_START_PROMPT:-0}"
+AUDIT_END_PROMPT="${PI_AGENT_AUDIT_END_PROMPT:-20}"
+DEFER_SUMMARY="${PI_AGENT_DEFER_SUMMARY:-false}"
 CONTAINER_RUN_DIR="/workspace/grpo_run/runs/${RUN_NAME}"
 SYNC_DIR="${RUN_DIR}/shared_lora_sync"
 SYNC_FILE="${SYNC_DIR}/adapter_flattened.pt"
@@ -48,6 +54,27 @@ if docker top "${CONTAINER}" | grep -F 'swift.cli.rollout' | grep -v grep >/dev/
   exit 4
 fi
 test -r "${R4_RUN_DIR}/shared_lora_sync/adapter_flattened.pt"
+test -r "${ROOT}/shared/$(basename "${ROLLOUT_INNER}")"
+test -r "${ROOT}/shared/audit_online_grpo_reward_signal.py"
+test -r "${ROOT}/shared/summarize_partial_reward_audit.py"
+if [[ "${REWARD_CONTRACT}" != v1 && "${REWARD_CONTRACT}" != v2 ]]; then
+  printf 'invalid_reward_contract=%s\n' "${REWARD_CONTRACT}" >&2
+  exit 2
+fi
+if [[ "${DEFER_SUMMARY}" != true && "${DEFER_SUMMARY}" != false ]]; then
+  printf 'invalid_defer_summary=%s\n' "${DEFER_SUMMARY}" >&2
+  exit 2
+fi
+if ! [[ "${MAX_MODEL_LEN}" =~ ^[1-9][0-9]*$ && "${COMPLETION_BUDGET}" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'invalid_token_budget max_model_len=%s completion_budget=%s\n' \
+    "${MAX_MODEL_LEN}" "${COMPLETION_BUDGET}" >&2
+  exit 2
+fi
+if (( COMPLETION_BUDGET >= MAX_MODEL_LEN )); then
+  printf 'completion_budget_must_be_smaller_than_max_model_len=%s:%s\n' \
+    "${COMPLETION_BUDGET}" "${MAX_MODEL_LEN}" >&2
+  exit 2
+fi
 ACTUAL_R4_SHA256="$(sha256sum "${R4_RUN_DIR}/shared_lora_sync/adapter_flattened.pt" | awk '{print $1}')"
 if [[ "${ACTUAL_R4_SHA256}" != "${R4_LORA_SHA256}" ]]; then
   printf 'r4_lora_sha256_mismatch expected=%s actual=%s\n' \
@@ -74,6 +101,10 @@ printf '%s\n' "$(date -Is)" >"${RUN_DIR}/host_started_at"
     "${MAX_MODEL_LEN}" "${COMPLETION_BUDGET}"
   printf 'temperature=0.9\ntop_p=0.95\n'
   printf 'quality_claims_allowed=false\n'
+  printf 'rollout_inner=%s\n' "${ROLLOUT_INNER}"
+  printf 'reward_contract=%s\n' "${REWARD_CONTRACT}"
+  printf 'audit_prompt_range=%s:%s\n' "${AUDIT_START_PROMPT}" "${AUDIT_END_PROMPT}"
+  printf 'defer_summary=%s\n' "${DEFER_SUMMARY}"
   docker inspect -f \
     'image={{.Config.Image}} status={{.State.Status}} privileged={{.HostConfig.Privileged}} network={{.HostConfig.NetworkMode}} ipc={{.HostConfig.IpcMode}}' \
     "${CONTAINER}"
@@ -108,7 +139,7 @@ cleanup() {
 trap cleanup EXIT
 
 docker exec "${CONTAINER}" \
-  bash /workspace/grpo_run/shared/run_qwen36_grpo_pi_rollout_inner.sh \
+  bash "${ROLLOUT_INNER}" \
   "${RUN_NAME}" "${MAX_MODEL_LEN}" "${COMPLETION_BUDGET}" "${HTTP_PORT}" \
   >"${RUN_DIR}/rollout.log" 2>&1 &
 ROLLOUT_WRAPPER_PID=$!
@@ -138,6 +169,14 @@ docker exec "${CONTAINER}" python "${LOAD_SCRIPT}" \
   >"${RUN_DIR}/adapter_load_summary.json"
 
 set +e
+AUDIT_EXTRA_ARGS=(
+  --reward-contract "${REWARD_CONTRACT}"
+  --start-prompt "${AUDIT_START_PROMPT}"
+  --end-prompt "${AUDIT_END_PROMPT}"
+)
+if [[ "${DEFER_SUMMARY}" == true ]]; then
+  AUDIT_EXTRA_ARGS+=(--defer-summary)
+fi
 docker exec \
   -e PI_AGENT_VERIFIER_MANIFEST="${VERIFIER_MANIFEST}" \
   -e PYTHONPATH=/workspace/grpo_run/shared/rollout_python_stubs:/workspace/ms-swift \
@@ -149,6 +188,7 @@ docker exec \
   --temperature 0.9 \
   --top-p 0.95 \
   --timeout 1800 \
+  "${AUDIT_EXTRA_ARGS[@]}" \
   >"${RUN_DIR}/audit.log" 2>&1
 AUDIT_EXIT=$?
 set -e
@@ -157,7 +197,13 @@ if [[ "${AUDIT_EXIT}" -ne 0 ]]; then
   exit "${AUDIT_EXIT}"
 fi
 
-python - "${RUN_DIR}/audit/summary.json" <<'PY' >"${RUN_DIR}/audit_safe_summary.json"
+if [[ "${DEFER_SUMMARY}" == true ]]; then
+  docker exec "${CONTAINER}" python "${PARTIAL_SUMMARY_SCRIPT}" \
+    "${CONTAINER_RUN_DIR}/audit/groups" \
+    --output "${CONTAINER_RUN_DIR}/audit/partial_summary.json" \
+    >"${RUN_DIR}/audit_safe_summary.json"
+else
+  python - "${RUN_DIR}/audit/summary.json" <<'PY' >"${RUN_DIR}/audit_safe_summary.json"
 import json
 import sys
 from pathlib import Path
@@ -176,6 +222,7 @@ safe = {
 }
 print(json.dumps(safe, ensure_ascii=False, indent=2))
 PY
+fi
 
 printf 'audit_complete=true\n' >>"${RUN_DIR}/host_environment_summary.txt"
 exit 0

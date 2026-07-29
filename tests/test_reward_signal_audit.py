@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import audit_online_grpo_reward_signal as audit  # noqa: E402
+from pi_trajectory_contract import reward_decision  # noqa: E402
 
 
 def make_sample(prompt_index: int, sample_index: int, reward: float, trajectory: str):
@@ -117,6 +118,20 @@ class RewardSignalAuditTest(unittest.TestCase):
         )
         self.assertFalse(summary["decision_gate"]["training_authorized_by_this_audit"])
         json.dumps(summary, ensure_ascii=False)
+
+    def test_v2_reward_does_not_treat_truncation_as_final_answer(self):
+        sample = make_sample(0, 0, 1.0, "a")
+        sample["reward_breakdown"]["queried_required_tables"] = True
+        sample["reward_breakdown"]["gold_evidence"] = True
+        sample["rollout_infos"]["stopped_reason"] = "total_token_limit"
+        decision = reward_decision(
+            sample["reward_breakdown"],
+            sample["rollout_infos"],
+            current_reward=sample["reward"],
+        )
+        self.assertEqual(decision.current_reward, 1.0)
+        self.assertEqual(decision.hybrid_reward, 0.0)
+        self.assertFalse(decision.terminal_answer)
 
 
 if __name__ == "__main__":

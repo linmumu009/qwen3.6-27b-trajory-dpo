@@ -18,6 +18,8 @@ RUN_DIR="/workspace/grpo_run/runs/${RUN_NAME}"
 DATASET=/workspace/grpo_run/shared/train_20_unique_prompts.jsonl
 MANIFEST=/workspace/grpo_run/shared/manifest.json
 PLUGIN=/workspace/grpo_run/shared/pi_agent_grpo_plugin.py
+V2_PLUGIN=/workspace/grpo_run/shared/pi_agent_grpo_v2_plugin.py
+TRAJECTORY_CONTRACT=/workspace/grpo_run/shared/pi_trajectory_contract.py
 SHARED_SYNC_PLUGIN=/workspace/grpo_run/shared/shared_file_lora_sync_patch.py
 CROSS_HOST_PLUGIN=/workspace/grpo_run/shared/cross_host_lora_sync_patch.py
 SERVER_MODE_PLUGIN=/workspace/grpo_run/shared/server_mode_no_local_vllm_patch.py
@@ -28,6 +30,8 @@ test -r "${MODEL}/model.safetensors.index.json"
 test -r "${DATASET}"
 test -r "${MANIFEST}"
 test -r "${PLUGIN}"
+test -r "${V2_PLUGIN}"
+test -r "${TRAJECTORY_CONTRACT}"
 test -r "${SHARED_SYNC_PLUGIN}"
 test -r "${CROSS_HOST_PLUGIN}"
 test -r "${SERVER_MODE_PLUGIN}"
@@ -65,6 +69,9 @@ export LLIN_REMOTE_VLLM_VERSION=0.23.0
   printf 'num_generations=8\ngeneration_batch_size=8\n'
   printf 'weight_transport=versioned_rsync_atomic_symlink\n'
   printf 'lora_target_modules=linear_qkv,linear_fc1\n'
+  printf 'trajectory_contract=llin-pi-trajectory-grpo-v2\n'
+  printf 'loss_contract=assistant_and_tool_call_only\n'
+  printf 'reward_contract=sparse_terminal_outcome_plus_verified_progress\n'
   printf 'quality_claims_allowed=false\n'
   python -V
   python -c 'import torch, torch_npu, transformers, swift; print(f"torch={torch.__version__}"); print(f"transformers={transformers.__version__}"); print(f"swift={swift.__version__}")'
@@ -74,6 +81,8 @@ export LLIN_REMOTE_VLLM_VERSION=0.23.0
     "${DATASET}" \
     "${MANIFEST}" \
     "${PLUGIN}" \
+    "${V2_PLUGIN}" \
+    "${TRAJECTORY_CONTRACT}" \
     "${SHARED_SYNC_PLUGIN}" \
     "${CROSS_HOST_PLUGIN}" \
     "${SERVER_MODE_PLUGIN}"
@@ -104,10 +113,11 @@ python -m torch.distributed.run \
   --vllm_server_timeout 1800 \
   --vllm_enable_lora true \
   --vllm_server_pass_dataset true \
-  --external_plugins "${PLUGIN}" "${SERVER_MODE_PLUGIN}" "${SHARED_SYNC_PLUGIN}" "${CROSS_HOST_PLUGIN}" \
-  --multi_turn_scheduler pi_agent_scheduler \
+  --external_plugins "${PLUGIN}" "${V2_PLUGIN}" "${SERVER_MODE_PLUGIN}" "${SHARED_SYNC_PLUGIN}" "${CROSS_HOST_PLUGIN}" \
+  --multi_turn_scheduler pi_agent_scheduler_v2 \
   --max_turns 16 \
-  --reward_funcs pi_agent_trajectory \
+  --reward_funcs pi_agent_trajectory_v2 \
+  --loss_scale default \
   --num_generations 8 \
   --generation_batch_size 8 \
   --steps_per_generation 1 \

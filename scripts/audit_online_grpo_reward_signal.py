@@ -22,6 +22,8 @@ from typing import Any
 
 import requests
 
+from pi_trajectory_contract import reward_decision
+
 
 STANDARD_REQUEST_FIELDS = {
     "messages",
@@ -158,7 +160,12 @@ def sample_failure_reasons(sample: dict[str, Any]) -> list[str]:
         if not breakdown[field]:
             reasons.append(reason)
     stopped_reason = infos.get("stopped_reason")
-    if stopped_reason in {"length", "total_token_limit", "max_turns"}:
+    if stopped_reason in {
+        "length",
+        "total_token_limit",
+        "observation_token_limit",
+        "max_turns",
+    }:
         reasons.append(f"stopped_{stopped_reason}")
     for event in infos.get("tool_events") or []:
         if not event.get("ok", False):
@@ -355,6 +362,12 @@ def main() -> int:
     parser.add_argument("--start-prompt", type=int, default=0)
     parser.add_argument("--end-prompt", type=int)
     parser.add_argument("--defer-summary", action="store_true")
+    parser.add_argument(
+        "--reward-contract",
+        choices=("v1", "v2"),
+        default="v1",
+        help="v2 requires a terminal final_answer and uses conservative hybrid reward",
+    )
     args = parser.parse_args()
 
     dataset = args.dataset.resolve()
@@ -457,7 +470,18 @@ def main() -> int:
             workspace_value = infos.get("sandbox_path")
             workspace = Path(workspace_value) if isinstance(workspace_value, str) else None
             breakdown = asdict(plugin.score_trajectory(messages, verifier, workspace))
-            if float(breakdown["score"]) < 0 or float(breakdown["score"]) > 1:
+            decision = reward_decision(
+                breakdown,
+                infos,
+                current_reward=float(breakdown["score"]),
+                progress_reward=0.2,
+            )
+            reward = (
+                float(breakdown["score"])
+                if args.reward_contract == "v1"
+                else decision.hybrid_reward
+            )
+            if reward < 0 or reward > 1:
                 raise ValueError("reward outside [0, 1]")
             budget = int(infos.get("trajectory_budget_tokens") or args.max_tokens)
             used = int(infos.get("generated_tokens") or 0) + int(
@@ -473,8 +497,10 @@ def main() -> int:
                     "environment_id": environment_id,
                     "verifier_id": verifier_id,
                     "request_uuid": request["uuid"],
-                    "reward": float(breakdown["score"]),
+                    "reward": reward,
+                    "reward_contract": args.reward_contract,
                     "reward_breakdown": breakdown,
+                    "trajectory_v2_reward": decision.to_dict(),
                     "rollout_infos": infos,
                     "budget_hit": budget_hit,
                     "trajectory_sha256": hashlib.sha256(

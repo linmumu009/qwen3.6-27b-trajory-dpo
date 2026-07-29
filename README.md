@@ -14,7 +14,7 @@ Qwen3.6-27B 轨迹偏好训练工程。目标不是只证明 DPO 能运行，而
 
 ## 当前结论
 
-截至 2026-07-28，工程和证据已经足够进入受控 pilot，但不适合直接开展无对照的全量普通 DPO。
+截至 2026-07-29，工程和证据已经足够进入受控 pilot，但不适合直接开展无对照的全量普通 DPO 或长跑在线 GRPO。
 
 已有 21 条件、3 个训练随机种子、每条件 192 次 rollout 的冻结确认实验表明：
 
@@ -34,7 +34,9 @@ verified RPO 相对 matched continued-SFT：
 
 因此下一轮以 **chosen-SFT warm start + verified RPO** 为主线；普通 DPO保留为对照，不作为默认训练目标。
 
-多机工程方面，`5 号训练 + 6 号在线 rollout` 的同步 GRPO 单步闭环已经通过：初始 LoRA 由 5 号直接 rsync 到 6 号，经过 SHA256、版本目录和原子 symlink 发布，6 号 8 个 worker 全部确认加载；随后完成 8 条在线 PI agent 轨迹、reward、反向更新和 checkpoint-1。该 smoke 的 8 条 reward 全为 `0.3`、advantage 全为 `0`，所以只能证明工程闭环，不能证明模型效果提升。后续 reward-signal audit 在用户停止前完成 17/20 个 prompt、共 136 条轨迹，其中 16 组存在非零 reward 方差；但 66.9% 轨迹命中总 token 上限，reward 仍大量集中在 `0.3`。因此下一阶段应先审查 verifier 分量和候选 prompt，不直接开始长跑训练。
+多机工程方面，`5 号训练 + 6 号在线 rollout` 的同步 GRPO 单步闭环已经通过：初始 LoRA 由 5 号直接 rsync 到 6 号，经过 SHA256、版本目录和原子 symlink 发布，6 号 8 个 worker 全部确认加载；随后完成 8 条在线 PI agent 轨迹、reward、反向更新和 checkpoint-1。该 smoke 的 8 条 reward 全为 `0.3`、advantage 全为 `0`，所以只能证明工程闭环，不能证明模型效果提升。后续 reward-signal audit 在用户停止前完成 17/20 个 prompt、共 136 条轨迹，其中 16 组存在非零旧 reward 方差；但 66.9% 轨迹命中总 token 上限，旧 reward 仍大量集中在 `0.3`。
+
+对这 136 条历史轨迹进行 v2 反事实重放后，确认纯终局 reward 过稀疏：只有 4/17 组具有方差；保守混合 reward 为 12/17 组保留方差。当前在线 GRPO 默认契约因此改为：只训练 assistant 内容与 tool call，工具执行结果只作为下一步观察而不进入 loss；`1.0` 只奖励安全、协议有效、成功查询必需表且命中 gold evidence 的终局答案，`0.2` 只奖励同样满足前置条件但尚未命中 gold 的终局验证进展；截断、仅安全调用、仅有答案或一般工具成功均为 `0`。不采用“每一步都给分”的稠密过程奖励，除非后续获得独立、校准过的 step verifier。
 
 ## 已核实资产
 
@@ -75,7 +77,7 @@ verified RPO 相对 matched continued-SFT：
 
 ## 下一轮实验：P-001 轨迹 RPO pilot
 
-状态：`data-frozen / multihost-data-plane-passed / partial-reward-signal-audited / training-runtime-gated`
+状态：`data-frozen / multihost-data-plane-passed / trajectory-grpo-v2-engineered / no-long-run-authorized`
 
 ### 目标
 
@@ -475,3 +477,99 @@ r2 冻结证据：
 1. 人工复核 index 2、10、11 的 reward 分量与轨迹正确性，并抽查 0.3 大量聚集是否为合理 verifier 判定。
 2. 修正或确认 token 统计口径，降低 66.9% 的 budget hit，再冻结候选 prompt。
 3. 只对 verifier 可信且组内方差非零的 prompt 做小型在线 GRPO pilot，并保留 base/chosen-SFT/continued-SFT 对照；不得由本次 audit 自动授权训练。
+
+### 2026-07-29：E-007 PI 轨迹 GRPO v2 契约、反事实审计与无训练 smoke
+
+方法决策：
+
+- 工具执行结果是环境 observation：必须保留在后续上下文中，但不属于策略动作，不进入 policy loss。
+- assistant 内容和 tool call 是策略 action：进入 loss；prompt、system、user 和 tool response 全部显式 mask。
+- 默认不采用“每一步都奖励”的稠密过程级 GRPO。当前没有独立、校准过的 step verifier，直接按调用次数、命令成功或中间文本给分会奖励绕路、重复调用和 verifier hack。
+- v2 使用保守混合 reward：
+  - `1.0`：真实 `final_answer`，且 safe、tool protocol 有效、工具成功、查询必需表、命中 gold evidence；
+  - `0.2`：真实 `final_answer`，满足以上前置条件但尚未命中 gold evidence，作为可验证进展；
+  - `0.0`：截断、仅安全、仅有文本答案、一般工具成功、未查询必需表或其他情况。
+- 工具结果可以作为 verifier 判断任务结果的证据，但工具结果 token 本身不获得梯度，也不因为“被执行出来”自动得分。
+- 该选择与 [Search-R1](https://arxiv.org/abs/2503.09516) 的 retrieval observation masking + outcome reward、[ReTool](https://arxiv.org/abs/2504.11536) 的结果导向工具强化学习一致；细粒度 credit assignment 留到有独立 step verifier 后再评估，如 [Agent Lightning](https://arxiv.org/abs/2508.03680) 所讨论的 agent credit assignment。
+
+现有实现审计：
+
+- 真实 ms-swift Qwen3.6 模板验证通过：
+  - 总 token：340
+  - 可训练策略动作 token：50
+  - 被 mask 的 prompt/observation token：290
+  - assistant action、tool call、final action 均可训练；
+  - user observation、tool result 均存在于上下文但不进入 loss。
+- 发现旧调度器的两个证据缺陷：
+  1. HTTP rollout 返回的 `choice.token_ids` 为空，旧 `generated_tokens` 因而在 136 条中全部错误记录为 0；
+  2. 旧 verifier 用“最后存在 assistant 内容”代替真实终止原因，导致 136 条都被记为 `has_final_answer=true`，但实际只有 44 条以 `final_answer` 结束，另外 92 条已截断。
+- v2 在引擎不返回 token IDs 时使用 tokenizer 回退计数，并分别记录：
+  - `policy_action_tokens`
+  - `engine_reported_policy_tokens`
+  - `fallback_policy_tokens`
+  - `observation_tokens`
+- 轨迹预算拆分为总预算、策略保留预算、累计 observation 上限和单次工具结果上限；工具输出仍可进入上下文，但不能吞掉全部策略预算。
+- ms-swift 当前 HTTP response schema 不接受布尔型 message `loss`。v2 改为 schema 可接受、模板真值语义等价的字符串标记；修正后真实模板仍得到完全相同的 `50 trainable / 290 masked`。
+
+136 条历史轨迹的 CPU-only 反事实重放：
+
+| reward 契约 | reward 分布 | 非零组内方差 |
+|---|---|---:|
+| 旧 v1 | `0:19 / 0.3:90 / 0.5:17 / 1:10` | 16/17 |
+| 纯终局 outcome | `0:126 / 1:10` | 4/17 |
+| v2 保守混合 | `0:115 / 0.2:11 / 1:10` | 12/17 |
+
+- 真实终局答案：44/136；截断：92/136。
+- outcome success：10；verified progress：11。
+- 纯终局 reward 对当前数据过稀疏；旧 v1 又大量奖励 `0.3` 的浅层条件。v2 保留 12/17 组方差，同时删除“安全调用/任意答案即得分”。
+- 失败责任脱敏计数：
+  - agent command-not-found：137
+  - agent execution error：26
+  - agent missing resource：22
+  - agent policy blocked：27
+  - ambiguous other：11
+- 反事实摘要只保留在 6 号服务器，SHA256：`432db232d7ef3455036c91af96db0fda8ac06147b9468f149cd90203930492d3`；没有执行 optimizer 或权重更新。
+
+工程更新：
+
+- 新增 `scripts/pi_trajectory_contract.py`：统一 action mask、observation budget、失败责任和 v2 reward 决策。
+- 新增 `scripts/pi_agent_grpo_v2_plugin.py`：v2 scheduler 与 ORM。
+- 新增 `scripts/audit_pi_trajectory_v2.py`：历史轨迹 CPU-only 反事实审计，只输出脱敏聚合。
+- 新增 `scripts/verify_pi_action_loss_contract.py`：用真实 tokenizer/template 验证 observation 零 loss。
+- 新增 `scripts/run_qwen36_grpo_pi_rollout_v2_inner.sh` 和 `scripts/run_p001_trajectory_v2_smoke_6.sh`。
+- 在线 trainer 默认切换到 `pi_agent_scheduler_v2 + pi_agent_trajectory_v2 + loss_scale=default`，但本次没有启动 trainer。
+- reward audit 支持 v1/v2 契约、prompt 范围、可变模型上下文/轨迹预算和部分安全汇总。
+- 安全汇总新增 action/observation token、真实终止、v2 判定和失败责任统计；不输出轨迹正文。
+- 新增 9 项测试，覆盖 observation mask、截断不得伪装终局成功、混合奖励、失败责任、预算保护和 audit 门禁；全部通过。
+- 新增 `.gitattributes`，固定 Markdown、Python、shell 文件为 LF，避免 Windows checkout 破坏服务器脚本。
+
+无训练 smoke：
+
+| run | 参数 | 结果 |
+|---|---|---|
+| `p001_trajectory_v2_prompt0_smoke_20260729_r1` | prompt 0，8 条，2048 budget | 轨迹生成后被 ms-swift HTTP schema 拒绝布尔 `loss`；无完整 group、无训练、自动释放 NPU。 |
+| `p001_trajectory_v2_prompt0_smoke_20260729_r2` | prompt 0，8 条，2048 budget | 8/8 完整返回，接口修复通过；reward 全 0；`length:3 / observation_token_limit:5`，真实终局 0。证明契约可运行，但预算不足。 |
+| `p001_trajectory_v2_prompt2_budget3072_smoke_20260729_r3` | prompt 2，8 条，model 12288 / trajectory 3072 | 8/8 完整返回；reward `0:4 / 0.2:1 / 1:3`，均值 0.4，组内标准差 0.4690；真实终局 4，observation 截断 4。 |
+
+r3 脱敏证据：
+
+- outcome success：3；verified progress：1；组内存在三档 reward。
+- action token：中位数 1288.5，均值 1260，范围 925–1492。
+- observation token：中位数 976.5，均值 925.4，范围 727–1024。
+- 引擎原生 token 计数仍为 0，但 tokenizer 回退计数覆盖 8/8，旧的全零统计问题已修复。
+- 完整 group SHA256：`e83ae3dff62bd34ac7dc3ee0f52ea328bafaa1f5406d83573bf21a92f335171c`。
+- `quality_claims_allowed=false`、`policy_update_performed=false`；不能把该结果解释为模型效果已经提升。
+
+当前门禁与下一步：
+
+- v2 action/observation 契约、reward 契约、多机 rollout 接口和脱敏审计已经工程跑通。
+- prompt 2 证明混合 reward 可以产生有效组内排序信号，但单题不足以授权训练，且 4/8 仍在 observation budget 处截断。
+- 暂不启动 5 号 optimizer。下一步先实现 observation budget 耗尽后的受控 finalization 回合，再在多个历史高区分度 prompt 上复验终局率、reward 方差和 verifier 正确性。
+- 通过后只运行 1-step v2 GRPO，检查 advantage 非零、loss/grad finite、checkpoint 和 5→6 权重同步；仍不自动授权长跑。
+
+资源状态：
+
+- 所有 v2 smoke 都只在 6 号执行 rollout，没有让 Windows 参与模型、轨迹或 checkpoint 数据面。
+- 只使用自有容器 `llin-qwen36-grpo-pi-rollout-priv-host-0727` 和 `llin-*` image。
+- 5 号 trainer `llin-qwen36-grpo-trainer-m05-p001-dpo-base` 保持停止。
+- r3 完成后 6 号 rollout container 回到只运行 `sleep`；5、6 号均无 NPU 进程。
