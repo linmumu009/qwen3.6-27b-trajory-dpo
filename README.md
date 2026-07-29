@@ -36,6 +36,8 @@ verified RPO 相对 matched continued-SFT：
 
 多机工程方面，`5 号训练 + 6 号在线 rollout` 的同步 GRPO 已从半机 8 卡扩展到两台各 16 张计算 NPU，并完成 40K 上下文的真实多提示单步闭环：5 号采用 `TP8 × PP1 × CP2 × SP`，6 号采用 `TP8 × DP2`；初始 LoRA 由 5 号直接 rsync 到 6 号，经 SHA256、版本目录和原子 symlink 发布后由全部 rollout worker 确认加载。最新修正版单步使用 prompt 2/10，各生成 8 条轨迹，reward 为 `0×4 / 0.2×3 / 1×9`，16/16 advantage 非零且 finite；关闭 1-step warmup 后，更新 checkpoint 的 LoRA-B、Megatron BF16 model 和 FP32 optimizer master 均确认非零且 finite，HF adapter SHA256 变为 `eddb8468ac5874eeef7931adf5bb803573867bd1ecab04faedabb5449ff64cf8`。该结果证明 40K 全机工程闭环、有效优化信号和真实参数更新，不等同于独立 heldout 上的模型效果提升。此前把 warmup=3% 的 1-step run 记为“权重已更新”是不准确的：它完成了反向和 checkpoint，但首步实际学习率为 0，LoRA-B 未变化。
 
+随后完成的 4 个 train-disjoint 可执行任务、每策略 8 条轨迹的 40K 成对门禁显示：零学习率精确基线为 `5/8` 成功，warmup=0 单步更新后为 `4/8`，差值 `-12.5` 个百分点；下降集中在 prompt 0，其余三个 prompt 持平。样本量不足以证明总体退化，但已经足以否定“本次单步带来可见提升”，因此当前配置仍不授权长跑。动态扁平 LoRA 经零学习率 checkpoint 逐字节重建验证并可被全部 rollout worker 加载；静态 PEFT 路径持续输出异常 `!`，不能用于效果判断。
+
 对这 136 条历史轨迹进行 v2 反事实重放后，确认纯终局 reward 过稀疏：只有 4/17 组具有方差；保守混合 reward 为 12/17 组保留方差。当前在线 GRPO 默认契约因此改为：只训练 assistant 内容与 tool call，工具执行结果只作为下一步观察而不进入 loss；`1.0` 只奖励安全、协议有效、成功查询必需表且命中 gold evidence 的终局答案，`0.2` 只奖励同样满足前置条件但尚未命中 gold 的终局验证进展；截断、仅安全调用、仅有答案或一般工具成功均为 `0`。不采用“每一步都给分”的稠密过程奖励，除非后续获得独立、校准过的 step verifier。
 
 ## 已核实资产
@@ -769,3 +771,115 @@ warmup=0 修正版证据：
 - 5、6 号本次训练、rollout、SSH tunnel 和 LoRA watcher 均按精确 PID 停止。
 - 28220/28221/29694 无监听；两机 NPU 均显示 `No running processes found`。
 - 两个自有全机容器保持 running，但内部只有 `sleep infinity`，不占用 NPU。
+
+### 2026-07-29：E-010 在线 GRPO 多机全异步架构与框架选型调研
+
+目标与边界：
+
+- 基于已经通过的 `5 号全机训练 + 6 号全机 rollout`、40K、多提示、真实参数更新同步基线，评估是否将在线 GRPO 扩展为多个 rollout 节点持续生产、全局队列按完整 group 凑 batch、trainer 与 rollout 重叠运行的全异步架构。
+- 本次只进行架构和公开资料调研，没有启动服务器任务、容器、NPU 或长跑，也没有修改现有训练/rollout 代码。
+
+核心结论：
+
+- GRPO 的全局队列必须按完整 prompt group 消费。当前 `num_generations=8`、`global_batch=16` 对应每步两个完整的 8 条 group，不能把来自不同 prompt 的任意 16 条完成轨迹直接混合计算 advantage。
+- 第一版异步 PoC 建议采用 `max_policy_age=1`、逐 token rollout logprob、Importance Sampling、有界 ready queue 和多版本 rollout worker；新请求使用新版本，已开始的旧请求允许在旧版本上完成。暂不启用单条轨迹跨策略版本的 Partial Rollout。
+- 当前 MS-Swift 链路可以作为同步基线，但缺少持久化全局 Group Buffer、轨迹版本/replay、陈旧度、off-policy 修正和 queue checkpoint，不能直接视为全异步 RL 框架。
+- 当前 Ascend 环境的推荐验证顺序为：
+  1. veRL-NPU：Fully Async 与 Ascend 后端组合最贴近现有工程；
+  2. AReaL Ascend：原生全异步、Agent 和 Decoupled PPO 最完整；
+  3. 阿里 ROLL：Ascend 和 Agent 环境级异步能力明确；
+  4. MindSpeed-RL 仅参考 TransferDock/Partial Rollout，因相关能力仍为 Preview 且项目停止新增功能；
+  5. Slime 在 NVIDIA/AMD 上能力很强，但没有正式 Ascend 路线，当前不作为首选。
+- “增加 rollout 机器 + 取消 barrier”提高的是集群总吞吐和资源利用率，不会直接缩短单条 PI 轨迹；单轨迹仍需通过 continuous batching、会话亲和/prefix cache、工具并发、单轮上限和受控 finalization 优化。
+
+报告：
+
+- `技术报告/Qwen3.6-27B在线GRPO多机异步架构与框架选型报告_20260729.md`
+
+下一步门禁：
+
+- 不直接迁移正式训练或启动异步长跑。
+- 先完成 veRL-NPU 的 Qwen3.6、40K、多轮 PI Agent、rollout logprob、LoRA refit、完整 group 队列和 1-step 参数真实更新 PoC。
+- 若 veRL 在 Ascend Fully Async、Qwen3.6 或 LoRA 动态同步上失败，再启动 AReaL Ascend 最小 PoC。
+
+### 2026-07-29：E-011 更新 LoRA 动态发布与 40K train-disjoint 成对门禁
+
+目标与边界：
+
+- 将 E-009 的 warmup=0 单步 HF adapter 转换为当前在线 PI rollout worker 能原子加载的扁平 LoRA，并与零学习率精确基线做同服务、同题集、同参数的成对评测。
+- 本次评测集与在线训练 20 题在 `metadata.prompt_sha256` 上零重叠，但来自已有老板数据资产，只能称为内部 train-disjoint pilot，不能称为全新外部 heldout。
+- Windows 仅作 SSH 控制端；checkpoint、LoRA、题集、轨迹和评测结果全部留在 5/6 号服务器，5→6 发布走服务器内网。
+
+静态 PEFT 复现与动态 LoRA 重建：
+
+- E-009 更新 adapter 经服务器内网发布到 6 号后，静态 vLLM PEFT 服务的 base 输出正常语言，而 adapter 精确输出 32 个 `!`；该签名与此前 chosen-SFT/老板 GRPO adapter 的静态异常一致，故静态 PEFT 路径继续判定为不可用，不能据此判断训练后模型损坏。
+- 动态模板和 HF adapter 均为 408 个同名同 shape tensor，只是存储顺序不同；运行时模板的 metadata offset 以 byte 计。
+- 新增 `build_flattened_lora_from_peft.py`：按运行时 metadata 顺序重排 PEFT tensor，验证 key、shape、dtype 和连续 byte offset 后原子写出动态 payload。
+- 新增 `inspect_flattened_lora.py`：只输出 tensor 元数据、hash、finite/nonzero 统计，不打印权重内容。
+- 金标准验证使用 E-009 的零学习率 checkpoint：
+  - HF adapter SHA256：`f2341828039feb34c719f1c2d14832ddf8079d74f248843a17789f29e42f5936`
+  - 重建 tensor 与原始动态模板在 `28,121,984` bytes 上逐字节相同
+  - 两者 flattened tensor SHA256 均为 `aec4e42fffc5100d688efa2fe1e05648bb59b9115ecc61dbbfd34d7271b7b03a`
+- warmup=0 更新 adapter 重建后：
+  - payload SHA256：`c3488d42acf513935da0716d68c7c11ac0274aaf1a4c87ff821ef339409df7a5`
+  - flattened tensor SHA256：`430c550b31f20b04f049f7175e8752b918b1e7496e405cacbabc10cca73ed1a9`
+  - 408 个 tensor 全部 finite，源 adapter 非零元素 `13,549,580`
+- 零学习率和更新 payload 均由动态接口报告 `all_workers_loaded=true`；更新 adapter 的短语义 smoke 也能正常生成答案并执行工具，不再出现 `!`。
+
+可执行评测集冻结：
+
+- 源 eval：`strong_verified_27_prompt_v1/eval_prompts.jsonl`
+  - 4 行
+  - SHA256：`abd423fa66e1afead81ebf3f59746440db68f27eda4255aa0b3eb22cf03d6e78`
+- 在线训练 20 题 SHA256：`e819848b0cdde6f69bdfb08537060e02bcf6d95ea64a8f7d212539517dfc6b57`
+- verifier manifest SHA256：`e4269e118605c24773cfe749d479cc8cbdb637dd23fd277895d18e70233652ee`
+- `prepare_online_grpo_eval_prompts.py` 将 `prompt` 转为在线 scheduler 所需的 `messages`，保留工具和环境 metadata，绑定 verifier，并在写出前强制验证 train/eval prompt hash 零重叠。
+- 冻结输出 `eval_4_frozen_20260729.jsonl`：
+  - 4 个唯一 task、4 个唯一 environment
+  - 与训练 20 题 prompt overlap：`0`
+  - SHA256：`9798cdf58f3a0577525d30d9d0f45dae630ce5b51a28fa5eb964f2b2ed7b4bcc`
+
+评测协议：
+
+- 6 号同一个动态 LoRA 服务依次加载零学习率精确基线和 warmup=0 单步更新权重。
+- `max_model_len=40960`，completion budget `32768`，每轮 policy reserve `16384`，temperature `0`，top-p `1`。
+- 4 个冻结 prompt，每个策略每题 2 条轨迹，共 8 条；相同题序、verifier 和请求参数。
+- 2K completion smoke 中两策略均为 `0/2`，但全部有终局答案、工具协议有效且触发 finalization budget，证明 2K 会制造假阴性；正式门禁因此使用 40K。
+
+40K 成对结果：
+
+| 指标 | 零学习率精确基线 | warmup=0 单步更新 | 差值 |
+|---|---:|---:|---:|
+| 成功轨迹 | `5/8`（62.5%） | `4/8`（50.0%） | `-1/8`（-12.5 pp） |
+| 有终局答案 | `8/8` | `8/8` | 0 |
+| 命中 gold evidence | `5/8` | `4/8` | `-1/8` |
+| 正常 final answer 停止 | `5/8` | `4/8` | `-1/8` |
+| max-turn 停止 | `3/8` | `4/8` | `+1/8` |
+| 平均生成 token | `5297.0` | `4659.9` | `-12.0%` |
+| 平均总 token | `12275.8` | `11722.5` | `-4.5%` |
+| 平均耗时 | `859.5s` | `759.7s` | `-11.6%` |
+
+按 prompt 的两条轨迹 reward：
+
+| prompt | 零学习率精确基线 | warmup=0 单步更新 | 平均分差 |
+|---:|---|---|---:|
+| 0 | `[0, 1]` | `[0, 0]` | `-0.5` |
+| 1 | `[0, 0]` | `[0, 0]` | `0` |
+| 2 | `[1, 1]` | `[1, 1]` | `0` |
+| 3 | `[1, 1]` | `[1, 1]` | `0` |
+
+解释与门禁：
+
+- 该 8-vs-8 小样本不足以宣称总体显著退化，且同题重复 rollout 仍存在环境/生成随机性；但本次更新在预先关心的成功率上没有超过基线，长跑门禁不通过。
+- token 和耗时下降不能覆盖成功率下降，也不能单独解释为模型效率提升；更新策略同时出现更多 max-turn 和更少 gold evidence。
+- 两个策略均为 8/8 安全、8/8 工具协议有效、8/8 有成功工具调用，但每条轨迹都出现 `command_not_found`，部分还有执行或缺文件错误。后续必须把工具环境错误率纳入质量门禁，不能把“调用过工具”等同于工具链健康。
+- `TP8 × DP2` 服务虽然加载到全部 worker，但本轮请求主要落在第一组 8 张 NPU，第二组利用率很低；这不破坏同服务成对比较，但会显著浪费后续评测成本，长跑前要修复 DP2 路由/调度。
+- 下一步不是延长本次训练，而是先做多个独立 rollout seed 的 matched no-op/基线重复测量，扩大从未参与训练的 verifier 可信任务，再比较 continued-SFT、普通 DPO、verified RPO 和 trajectory-GRPO；只有成功率门禁稳定为正才增加 optimizer step。
+
+服务器证据与资源状态：
+
+- run：`p001_base_vs_step1_eval4_maxctx40k_20260729_r1`
+- 基线 trajectories SHA256：`e5ce54a488e67af69c8a73c77643f518f2ab21d08ce6518019802ee97cec9f5d`
+- 更新 trajectories SHA256：`113c5ae28b65d09e866c9c5d7e626ec5610b824f80ee01b3eb7df1acc91cd5ad`
+- 首次 40K 启动发现旧 8K worker 的孤儿进程占用显存；在未发送任何评测请求前重启自有 6 号容器完成清理，随后重试成功。
+- 评测结束后停止动态服务并重启 6 号自有容器；容器内只保留 `sleep infinity`，不占用 NPU。5 号保持训练结束后的空闲状态。
