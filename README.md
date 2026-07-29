@@ -34,7 +34,7 @@ verified RPO 相对 matched continued-SFT：
 
 因此下一轮以 **chosen-SFT warm start + verified RPO** 为主线；普通 DPO保留为对照，不作为默认训练目标。
 
-多机工程方面，`5 号训练 + 6 号在线 rollout` 的同步 GRPO 单步闭环已经通过：初始 LoRA 由 5 号直接 rsync 到 6 号，经过 SHA256、版本目录和原子 symlink 发布，6 号 8 个 worker 全部确认加载；随后完成 8 条在线 PI agent 轨迹、reward、反向更新和 checkpoint-1。该 smoke 的 8 条 reward 全为 `0.3`、advantage 全为 `0`，所以只能证明工程闭环，不能证明模型效果提升。后续 reward-signal audit 在用户停止前完成 17/20 个 prompt、共 136 条轨迹，其中 16 组存在非零旧 reward 方差；但 66.9% 轨迹命中总 token 上限，旧 reward 仍大量集中在 `0.3`。
+多机工程方面，`5 号训练 + 6 号在线 rollout` 的同步 GRPO 已从半机 8 卡扩展到两台各 16 张计算 NPU，并完成 40K 上下文的真实单步闭环：5 号采用 `TP8 × PP1 × CP2 × SP`，6 号采用 `TP8 × DP2`；初始 LoRA 由 5 号直接 rsync 到 6 号，经 SHA256、版本目录和原子 symlink 发布后由全部 rollout worker 确认加载。最新单步产生 16 条轨迹，reward 为 `0×3 / 0.2×2 / 1×11`，16/16 advantage 非零且 finite；随后完成反向更新和 checkpoint-1。该结果证明 40K 全机工程闭环和有效优化信号，不等同于独立 heldout 上的模型效果提升。此前半机 smoke 的 8 条 reward 全为 `0.3`、advantage 全为 `0`；后续 reward-signal audit 在用户停止前完成 17/20 个 prompt、共 136 条轨迹，其中 16 组存在非零旧 reward 方差，但 66.9% 轨迹命中总 token 上限，旧 reward 仍大量集中在 `0.3`。
 
 对这 136 条历史轨迹进行 v2 反事实重放后，确认纯终局 reward 过稀疏：只有 4/17 组具有方差；保守混合 reward 为 12/17 组保留方差。当前在线 GRPO 默认契约因此改为：只训练 assistant 内容与 tool call，工具执行结果只作为下一步观察而不进入 loss；`1.0` 只奖励安全、协议有效、成功查询必需表且命中 gold evidence 的终局答案，`0.2` 只奖励同样满足前置条件但尚未命中 gold 的终局验证进展；截断、仅安全调用、仅有答案或一般工具成功均为 `0`。不采用“每一步都给分”的稠密过程奖励，除非后续获得独立、校准过的 step verifier。
 
@@ -52,7 +52,7 @@ verified RPO 相对 matched continued-SFT：
 - 同任务还有 Qwen3.7-Max、DeepSeek-v4-Pro、GLM-5.2 轨迹和 verdict。
 - 四模型在 1500 个共同任务上可形成 871 个严格序偏好任务；其中 669 个满足 `partial/correct > incorrect/incomplete` 的强分离。
 - 现有 DPO/RPO 工程位于服务器项目 `llin-rl-dpo-p2`。
-- 16 张 NPU 当前 AICore 均为 0%，没有 NPU 进程；已完成的旧 DPO 容器和本次 GRPO trainer 均处于停止状态。
+- 16 张计算 NPU 当前没有 NPU 进程；自有全机 trainer `llin-qwen36-grpo-trainer-m05-p001-maxctx-0729` 保持运行但仅有 `sleep infinity`，不占用 NPU；已完成的旧 DPO 容器保持停止。
 
 ### 6 号机
 
@@ -67,6 +67,7 @@ verified RPO 相对 matched continued-SFT：
   - `correct > incorrect`：48
 - 40K 已使用 `TP8 × PP1 × CP2 × SP` 完成 worst20、checkpoint 严格恢复验证。
 - 48K 仅完成固定 worst1 的 500-step 压力测试；100K 属于无安全余量的极限配置，不用于正式 pilot。
+- 自有全机 rollout 容器 `llin-qwen36-grpo-pi-rollout-m06-maxctx-0729` 可见 16 张计算 NPU；当前仅有 `sleep infinity`，28220/28221 无监听且没有 NPU 进程。
 
 ## 数据质量注意事项
 
@@ -77,7 +78,7 @@ verified RPO 相对 matched continued-SFT：
 
 ## 下一轮实验：P-001 轨迹 RPO pilot
 
-状态：`data-frozen / multihost-data-plane-passed / trajectory-grpo-v2-engineered / no-long-run-authorized`
+状态：`data-frozen / multihost-data-plane-passed / trajectory-grpo-v2-engineered / maxctx40k-full-machine-1step-passed / no-long-run-authorized`
 
 ### 目标
 
@@ -573,3 +574,133 @@ r3 脱敏证据：
 - 只使用自有容器 `llin-qwen36-grpo-pi-rollout-priv-host-0727` 和 `llin-*` image。
 - 5 号 trainer `llin-qwen36-grpo-trainer-m05-p001-dpo-base` 保持停止。
 - r3 完成后 6 号 rollout container 回到只运行 `sleep`；5、6 号均无 NPU 进程。
+
+### 2026-07-29：E-008 两台全机 40K 轨迹 GRPO 单步闭环
+
+目标与边界：
+
+- 5 号机专职训练，6 号机专职在线 rollout；Windows 仍只发送 SSH 控制命令，不承载模型、轨迹、checkpoint 或两机数据中转。
+- 两台机器各有 8 块双芯片板卡，即各 16 张计算 NPU；此前自有 GRPO 容器只暴露 8 张，本次扩展为两台各使用完整 16 张。
+- 只创建和使用 `llin-*` 容器及镜像；旧自有容器、镜像、run 和 checkpoint 均保留，没有覆盖或删除。
+- 本次只授权工程单步，不自动扩展为长跑，也不以单题训练结果宣称模型质量提升。
+
+上下文选择：
+
+- 训练拓扑固定为 `16 ranks / TP8 × PP1 × CP2 × SP`；rollout 固定为 `TP8 × DP2`。
+- 选择 `max_model_len=40960`、轨迹总预算 `39936`：
+  - 40K 已在长上下文实验中完成 worst20 多样样本、20/20 step 和严格 checkpoint 恢复；
+  - 48K 只有固定 worst1 压力覆盖，不能代表多样样本稳定性；
+  - 100K 的峰值曾到 `63.997/64 GiB`，只剩约 3 MiB，不具备可恢复余量。
+- 使用真实 tokenizer/template 在 6 号服务器内审计 20 个 prompt，不输出 prompt 正文：
+  - token 范围：765–801；
+  - 最大 prompt：801 token；
+  - `801 + 39936 = 40737`，相对 40960 保留 223 token 的模板/边界余量。
+- 40K rollout 预算拆分：
+  - 策略保留：16384；
+  - 累计 observation：8192；
+  - 单次 observation：2048；
+  - 受控 finalization 保留：2048；
+  - 单回合策略生成上限：4096。
+
+工程更新：
+
+- 新增全机自有容器创建脚本：
+  - `scripts/create_p001_maxctx_trainer_5.sh`
+  - `scripts/create_p001_maxctx_rollout_6.sh`
+- 新增 `scripts/run_p001_online_grpo_rollout_host_6.sh`：提供常驻 rollout、就绪标记、NPU 时序记录和退出清理。
+- 新增 `scripts/audit_pi_prompt_token_lengths.py`：只输出 prompt token 长度和任务标识，不输出 prompt 正文。
+- 新增 `scripts/select_pi_prompt_subset.py`：在服务器内按索引选择训练行并输出行数/SHA256，不让数据经过 Windows。
+- trainer 的 rank、TP、CP、PP、数据集、generation batch、global batch 均改为显式可配置，并增加拓扑乘积与批大小前置校验。
+- rollout 的 TP/DP、上下文和轨迹预算改为显式可配置，并校验 `TP × DP` 等于可见计算 NPU 数。
+- v2 scheduler 新增受控 finalization：
+  - observation 预算耗尽后追加一个被 mask 的环境指令；
+  - finalization 回合禁用工具，只训练 assistant 最终动作；
+  - 单独记录 finalization 是否触发、是否成功及失败停止原因；
+  - observation 永远不能消耗 finalization 保留预算。
+- 新增单回合策略上限 4096，防止一次 assistant 生成独占整个 39936 token 的轨迹预算；轨迹累计上限仍保持 39936。
+- 脱敏汇总新增 finalization 计数；reward audit 将 finalization 长度/工具失败正确归为截断。
+- 本地 11 项相关测试全部通过，Python 编译、shell 语法检查和 `git diff --check` 均通过。
+
+容器与数据：
+
+| 机器 | 自有容器 | 自有镜像 | 可见计算 NPU |
+|---|---|---|---:|
+| 5 号 trainer | `llin-qwen36-grpo-trainer-m05-p001-maxctx-0729` | `llin-rl-dpo-p2-base:20260707` | 16 |
+| 6 号 rollout | `llin-qwen36-grpo-pi-rollout-m06-maxctx-0729` | `llin-vllm-ascend:grpo-pi-deps-20260727` | 16 |
+
+- 单题训练集在 5 号服务器内由原始 20 题数据选出 prompt index 2：
+  - 行数：1；
+  - SHA256：`dfacdc4c6ea16cf8d13669539591f0877e53bab4539f10c50d31a8904a77dbfd`；
+  - 数据正文没有经过 Windows。
+
+40K rollout 门禁：
+
+| run | 结果 | 说明 |
+|---|---|---|
+| `p001_trajectory_v2_prompt2_maxctx40k_finalization_smoke_20260729_r4` | 主动停止，无完整 group | 初版允许单个 assistant 回合最多使用全部 39936 token；确认请求会被单回合长生成拖住后按精确 PID 停止，未训练并自动释放 NPU。由此加入 4096 单回合策略上限。 |
+| `p001_trajectory_v2_prompt2_maxctx40k_finalization_smoke_20260729_r5` | 通过 | 8/8 完整轨迹，全部自然 `final_answer`，无预算截断、无 OOM；reward `0×2 / 0.2×1 / 1×5`，均值 0.65、组内标准差 0.4555。 |
+
+r5 额外证据：
+
+- 终局答案：8/8；budget hit：0/8。
+- 策略 action token：1281–1832，均值 1470.6。
+- observation token：937–5674，均值 2407.4。
+- finalization 触发/成功：0/0；原因不是功能失效，而是 40K 预算已让 8 条轨迹全部自然结束。
+- 初始老板 LoRA 精确加载：
+  - bytes：`28,186,699`
+  - tensor 数：`408`
+  - SHA256：`224c2eb37844d6dbe8a260c7b72de6270f49691b1182ec050f83b210757a725e`
+
+全机单步联调：
+
+| run | 结果 | 说明 |
+|---|---|---|
+| `p001_crosshost_grpo_v2_maxctx40k_1step_20260729_r1` | 参数校验失败，无训练 | 16-rank world 下 `generation_batch_size=8` 导致 per-device generation batch 为 0。未加载模型、未 rollout、未更新权重；清理两机进程和 NPU。 |
+| `p001_crosshost_grpo_v2_maxctx40k_1step_20260729_r2` | 参数校验失败，无训练 | 将 generation batch 提高到 16 后，框架要求它等于 `global_batch_size × steps_per_generation`；旧 global batch 仍为 8。未加载模型、未 rollout、未更新权重；清理两机进程和 NPU。 |
+| `p001_crosshost_grpo_v2_maxctx40k_1step_20260729_r3` | 成功 | 固定 `generation/global batch=16/16`、`num_generations=8`、`steps_per_generation=1`；完成 16 条轨迹、1 次 optimizer step 和 checkpoint-1。 |
+
+r3 同步与训练证据：
+
+- 5→6 初始 LoRA 同步：
+  - bytes：`28,186,699`
+  - tensor 数：`408`
+  - SHA256：`80aa906851ddd161fcd4e63d5336bbc90354e06dde445153ce67ebd4fa848556`
+  - 6 号版本目录、原子发布、ack 哈希一致；全部 rollout worker 报告加载成功。
+- 16 条轨迹分成两个 8 条 GRPO group：
+  - reward：`0×3 / 0.2×2 / 1×11`
+  - reward 均值：`0.7125`
+  - reward std：`0.4535`
+  - `frac_reward_zero_std=0`
+  - advantage：16/16 非零且 finite，范围 `[-1.84465, 0.71858]`
+- 单步数值：
+  - loss：`4.315e-05`
+  - KL：`8.028e-05`
+  - grad norm：`0.08107854`
+  - learning rate：`1e-06`
+  - 以上数值全部 finite，无 OOM、Traceback 或 RuntimeError。
+- 首次 40K/TP8×CP2 shape 包含 Ascend Triton 编译，完整单步耗时 17 分 11 秒；后续同 shape 可复用编译缓存。
+- checkpoint：
+  - `latest_checkpointed_iteration.txt == 1`
+  - LoRA `adapter_model.safetensors`：`28,181,384` bytes
+  - tensor 数：`408`
+  - 所有 tensor finite：`true`
+  - SHA256：`f2341828039feb34c719f1c2d14832ddf8079d74f248843a17789f29e42f5936`
+  - 同时保存完整 16-rank Megatron distributed checkpoint。
+- 脱敏 completions 文件只留在 5 号服务器：
+  - 记录批数：1，包含 16 条 completion；
+  - SHA256：`64278ca231ed4f4a26b0ed75484601eb609b1b1e41ee26c5d6ddae69bdb395f8`；
+  - 未将轨迹正文复制到 Windows 或 GitHub。
+
+结论与后续门禁：
+
+- 已证明两台各 16 张计算 NPU、40K 上下文、服务器内网权重同步、在线多轮工具轨迹、v2 reward、反向更新和 checkpoint 的完整工程闭环。
+- 已证明本次单题的两个 group 都有非零 reward 方差和 advantage；不同于旧半机 smoke 的全零 advantage。
+- 尚未证明模型效果提升：当前只有一个 prompt，且因为全机 batch 对齐被重复成两个 group；不得把单步 reward 或训练 loss 当成 heldout 改善。
+- 长跑前仍需冻结多个 verifier 可信且组内方差非零的 prompt，保留 chosen-SFT / continued-SFT / verified-RPO 对照，并运行独立 heldout 评测。
+
+最终资源状态：
+
+- 5、6 号的训练、rollout、SSH tunnel 和 LoRA watcher 均已按精确 PID 停止。
+- 28220/28221/29693 无监听；两机 `npu-smi` 均显示所有 NPU `No running processes found`。
+- 两个新自有容器仍为 running，但内部都只有 `sleep infinity`，不占用 NPU。
+- r1、r2 失败证据，r3 成功证据、checkpoint、哈希和日志全部保留；没有自动启动下一步或长跑。

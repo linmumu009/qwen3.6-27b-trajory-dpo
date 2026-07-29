@@ -83,6 +83,8 @@ def main() -> int:
     tool_calls: list[float] = []
     budget_hits = 0
     terminal_answers = 0
+    finalization_triggered = 0
+    finalization_succeeded = 0
     agent_failure_events = 0
     ambiguous_failure_events = 0
     per_prompt = []
@@ -113,6 +115,8 @@ def main() -> int:
         trajectory_contract_counts[str(infos.get("trajectory_contract"))] += 1
         reward_contract_counts[str(sample.get("reward_contract"))] += 1
         terminal_answers += int(infos.get("stopped_reason") == "final_answer")
+        finalization_triggered += int(bool(infos.get("finalization_triggered")))
+        finalization_succeeded += int(bool(infos.get("finalization_succeeded")))
         elapsed.append(float(infos.get("elapsed_seconds") or 0))
         generated_tokens.append(float(infos.get("generated_tokens") or 0))
         policy_action_tokens.append(float(infos.get("policy_action_tokens") or 0))
@@ -166,6 +170,8 @@ def main() -> int:
         "ambiguous_failure_event_count": ambiguous_failure_events,
         "stopped_reason_counts": dict(sorted(stopped_counts.items())),
         "terminal_answer_count": terminal_answers,
+        "finalization_triggered_count": finalization_triggered,
+        "finalization_succeeded_count": finalization_succeeded,
         "tool_failure_type_counts": dict(sorted(tool_failure_types.items())),
         "budget_hit_count": budget_hits,
         "budget_hit_rate": budget_hits / len(samples),

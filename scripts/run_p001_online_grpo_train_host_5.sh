@@ -14,6 +14,10 @@ TRAIN_ITERS="$5"
 MASTER_PORT="$6"
 GROUP_PORT="$7"
 HOST_RUN_DIR="/data3/llin/qwen3.6-27b-trajory-dpo/online_grpo/runs/${RUN_NAME}"
+TRAIN_DATASET="${PI_AGENT_TRAIN_DATASET:-/workspace/grpo_run/shared/train_20_unique_prompts.jsonl}"
+GENERATION_BATCH_SIZE="${PI_AGENT_GENERATION_BATCH_SIZE:-8}"
+NUM_GENERATIONS="${PI_AGENT_NUM_GENERATIONS:-8}"
+GLOBAL_BATCH_SIZE="${PI_AGENT_GLOBAL_BATCH_SIZE:-8}"
 
 case "${HOST_RUN_DIR}" in
   /data3/llin/qwen3.6-27b-trajory-dpo/online_grpo/runs/*) ;;
@@ -26,7 +30,12 @@ esac
 mkdir -p "${HOST_RUN_DIR}"
 printf '%s\n' "$(date -Is)" >"${HOST_RUN_DIR}/training_host_started_at"
 
-docker exec "${CONTAINER}" \
+docker exec \
+  -e PI_AGENT_TRAIN_DATASET="${TRAIN_DATASET}" \
+  -e PI_AGENT_GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE}" \
+  -e PI_AGENT_NUM_GENERATIONS="${NUM_GENERATIONS}" \
+  -e PI_AGENT_GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE}" \
+  "${CONTAINER}" \
   bash /workspace/grpo_run/shared/run_p001_online_grpo_train_inner.sh \
   "${RUN_NAME}" "${MAX_LENGTH}" "${COMPLETION_BUDGET}" "${TRAIN_ITERS}" \
   "${MASTER_PORT}" 127.0.0.1 "${GROUP_PORT}"

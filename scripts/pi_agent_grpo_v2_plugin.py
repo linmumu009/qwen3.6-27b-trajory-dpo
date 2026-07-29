@@ -50,6 +50,16 @@ class PiAgentSchedulerV2(v1.PiAgentScheduler):
         self.per_tool_observation_limit = int(
             os.environ.get("PI_AGENT_PER_TOOL_OBSERVATION_LIMIT", "384")
         )
+        self.finalization_token_reserve = int(
+            os.environ.get("PI_AGENT_FINALIZATION_TOKEN_RESERVE", "512")
+        )
+        self.per_turn_policy_token_limit = int(
+            os.environ.get("PI_AGENT_PER_TURN_POLICY_TOKEN_LIMIT", "4096")
+        )
+        if self.finalization_token_reserve <= 0:
+            raise ValueError("PI_AGENT_FINALIZATION_TOKEN_RESERVE must be positive")
+        if self.per_turn_policy_token_limit <= 0:
+            raise ValueError("PI_AGENT_PER_TURN_POLICY_TOKEN_LIMIT must be positive")
         observation_token_allowance(
             total_limit=self.total_token_limit,
             policy_reserve=self.policy_token_reserve,
@@ -57,6 +67,7 @@ class PiAgentSchedulerV2(v1.PiAgentScheduler):
             per_tool_limit=self.per_tool_observation_limit,
             policy_used=0,
             observation_used=0,
+            finalization_reserve=self.finalization_token_reserve,
         )
 
     def _fallback_generated_token_count(
@@ -94,6 +105,9 @@ class PiAgentSchedulerV2(v1.PiAgentScheduler):
         fallback_turns = 0
         observation_tokens = 0
         observation_exhausted = False
+        finalization_pending = False
+        finalization_triggered = False
+        finalization_succeeded = False
 
         while True:
             turn_config = copy.copy(request_config)
@@ -110,9 +124,21 @@ class PiAgentSchedulerV2(v1.PiAgentScheduler):
                 turn_config.max_tokens = min(
                     turn_config.max_tokens, remaining_total
                 )
+            turn_config.max_tokens = min(
+                turn_config.max_tokens,
+                self.per_turn_policy_token_limit,
+            )
+            turn_request = infer_request
+            if finalization_pending:
+                turn_config.max_tokens = min(
+                    turn_config.max_tokens,
+                    self.finalization_token_reserve,
+                )
+                turn_request = copy.copy(infer_request)
+                turn_request.tools = []
 
             response = await self.infer_engine.infer_async(
-                infer_request, turn_config, **kwargs
+                turn_request, turn_config, **kwargs
             )
             choice = response.choices[0]
             raw_content = choice.message.content
@@ -140,6 +166,17 @@ class PiAgentSchedulerV2(v1.PiAgentScheduler):
                 }
             )
 
+            if finalization_pending:
+                if choice.finish_reason == "length":
+                    stopped_reason = "finalization_length"
+                elif tool_calls:
+                    stopped_reason = "finalization_tool_call"
+                else:
+                    stopped_reason = (
+                        "final_answer" if assistant_content else "empty_final_answer"
+                    )
+                    finalization_succeeded = stopped_reason == "final_answer"
+                break
             if choice.finish_reason == "length":
                 stopped_reason = "length"
                 break
@@ -160,10 +197,10 @@ class PiAgentSchedulerV2(v1.PiAgentScheduler):
                     per_tool_limit=self.per_tool_observation_limit,
                     policy_used=policy_tokens,
                     observation_used=observation_tokens,
+                    finalization_reserve=self.finalization_token_reserve,
                 )
                 if available_observation_tokens <= 0:
                     observation_exhausted = True
-                    stopped_reason = "observation_token_limit"
                     break
 
                 name = call.function.name
@@ -210,7 +247,47 @@ class PiAgentSchedulerV2(v1.PiAgentScheduler):
                 )
 
             if observation_exhausted:
-                break
+                remaining_for_finalization = (
+                    self.total_token_limit - policy_tokens - observation_tokens
+                )
+                if remaining_for_finalization <= 64:
+                    stopped_reason = "observation_token_limit"
+                    break
+                infer_request.messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "The environment observation budget is exhausted. "
+                            "Do not call any more tools. Give the best grounded final "
+                            "answer using only the evidence already observed."
+                        ),
+                        "loss": MASK_LOSS_MARKER,
+                    }
+                )
+                finalization_pending = True
+                finalization_triggered = True
+                current_turn += 1
+                continue
+            if observation_tokens >= self.observation_token_limit:
+                remaining_for_finalization = (
+                    self.total_token_limit - policy_tokens - observation_tokens
+                )
+                if remaining_for_finalization > 64:
+                    infer_request.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The environment observation budget is exhausted. "
+                                "Do not call any more tools. Give the best grounded final "
+                                "answer using only the evidence already observed."
+                            ),
+                            "loss": MASK_LOSS_MARKER,
+                        }
+                    )
+                    finalization_pending = True
+                    finalization_triggered = True
+                    current_turn += 1
+                    continue
             if policy_tokens + observation_tokens >= self.total_token_limit - 64:
                 stopped_reason = "total_token_limit"
                 break
@@ -241,6 +318,10 @@ class PiAgentSchedulerV2(v1.PiAgentScheduler):
             "policy_token_reserve": self.policy_token_reserve,
             "observation_token_limit": self.observation_token_limit,
             "per_tool_observation_limit": self.per_tool_observation_limit,
+            "finalization_token_reserve": self.finalization_token_reserve,
+            "per_turn_policy_token_limit": self.per_turn_policy_token_limit,
+            "finalization_triggered": finalization_triggered,
+            "finalization_succeeded": finalization_succeeded,
             "tool_call_count": len(self._tool_events.get(uuid, [])),
             "tool_success_count": sum(
                 event["ok"] for event in self._tool_events.get(uuid, [])

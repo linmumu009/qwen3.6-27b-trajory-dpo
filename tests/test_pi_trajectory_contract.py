@@ -126,6 +126,29 @@ class PiTrajectoryContractTest(unittest.TestCase):
             0,
         )
 
+    def test_observation_budget_preserves_forced_finalization_tokens(self):
+        self.assertEqual(
+            observation_token_allowance(
+                total_limit=2048,
+                policy_reserve=768,
+                observation_limit=1024,
+                per_tool_limit=384,
+                policy_used=900,
+                observation_used=600,
+                finalization_reserve=512,
+            ),
+            0,
+        )
+
+    def test_failed_forced_finalization_is_truncated(self):
+        decision = reward_decision(
+            breakdown(queried_required_tables=True, gold_evidence=True),
+            {"stopped_reason": "finalization_length", "tool_events": []},
+        )
+        self.assertTrue(decision.truncated)
+        self.assertFalse(decision.terminal_answer)
+        self.assertEqual(decision.hybrid_reward, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,7 +15,7 @@ ROLLOUT_IP="$6"
 GROUP_PORT="$7"
 
 RUN_DIR="/workspace/grpo_run/runs/${RUN_NAME}"
-DATASET=/workspace/grpo_run/shared/train_20_unique_prompts.jsonl
+DATASET="${PI_AGENT_TRAIN_DATASET:-/workspace/grpo_run/shared/train_20_unique_prompts.jsonl}"
 MANIFEST=/workspace/grpo_run/shared/manifest.json
 PLUGIN=/workspace/grpo_run/shared/pi_agent_grpo_plugin.py
 V2_PLUGIN=/workspace/grpo_run/shared/pi_agent_grpo_v2_plugin.py
@@ -55,6 +55,34 @@ export LLIN_SHARED_LORA_SYNC_FILE="${RUN_DIR}/shared_lora_sync/adapter_flattened
 export LLIN_SHARED_LORA_SYNC_ROLE=train
 export LLIN_CROSS_HOST_SYNC_TIMEOUT=300
 export LLIN_REMOTE_VLLM_VERSION=0.23.0
+TRAIN_NPROC_PER_NODE="${PI_AGENT_TRAIN_NPROC_PER_NODE:-8}"
+TRAIN_TP_SIZE="${PI_AGENT_TRAIN_TP_SIZE:-4}"
+TRAIN_CP_SIZE="${PI_AGENT_TRAIN_CP_SIZE:-2}"
+TRAIN_PP_SIZE="${PI_AGENT_TRAIN_PP_SIZE:-1}"
+GENERATION_BATCH_SIZE="${PI_AGENT_GENERATION_BATCH_SIZE:-8}"
+NUM_GENERATIONS="${PI_AGENT_NUM_GENERATIONS:-8}"
+GLOBAL_BATCH_SIZE="${PI_AGENT_GLOBAL_BATCH_SIZE:-8}"
+if (( TRAIN_TP_SIZE * TRAIN_CP_SIZE * TRAIN_PP_SIZE != TRAIN_NPROC_PER_NODE )); then
+  printf 'train_topology_world_size_mismatch nproc=%s tp=%s cp=%s pp=%s\n' \
+    "${TRAIN_NPROC_PER_NODE}" "${TRAIN_TP_SIZE}" \
+    "${TRAIN_CP_SIZE}" "${TRAIN_PP_SIZE}" >&2
+  exit 3
+fi
+if (( GENERATION_BATCH_SIZE < TRAIN_NPROC_PER_NODE )); then
+  printf 'generation_batch_smaller_than_world_size batch=%s world=%s\n' \
+    "${GENERATION_BATCH_SIZE}" "${TRAIN_NPROC_PER_NODE}" >&2
+  exit 3
+fi
+if (( GENERATION_BATCH_SIZE % NUM_GENERATIONS != 0 )); then
+  printf 'generation_batch_not_divisible batch=%s generations=%s\n' \
+    "${GENERATION_BATCH_SIZE}" "${NUM_GENERATIONS}" >&2
+  exit 3
+fi
+if (( GENERATION_BATCH_SIZE != GLOBAL_BATCH_SIZE )); then
+  printf 'generation_global_batch_mismatch generation=%s global=%s steps=1\n' \
+    "${GENERATION_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" >&2
+  exit 3
+fi
 
 {
   printf 'started_at=%s\n' "$(date -Is)"
@@ -63,10 +91,12 @@ export LLIN_REMOTE_VLLM_VERSION=0.23.0
   printf 'dataset=%s\n' "${DATASET}"
   printf 'max_length=%s\ncompletion_budget=%s\n' "${MAX_LENGTH}" "${COMPLETION_BUDGET}"
   printf 'train_iters=%s\n' "${TRAIN_ITERS}"
-  printf 'train_topology=tp4_pp1_cp2_sp\n'
-  printf 'rollout_topology=tp4_dp2\n'
+  printf 'train_topology=tp%s_pp%s_cp%s_sp\n' \
+    "${TRAIN_TP_SIZE}" "${TRAIN_PP_SIZE}" "${TRAIN_CP_SIZE}"
   printf 'rollout_ip=%s\nrollout_http_port=28220\nrollout_group_port=%s\n' "${ROLLOUT_IP}" "${GROUP_PORT}"
-  printf 'num_generations=8\ngeneration_batch_size=8\n'
+  printf 'num_generations=%s\ngeneration_batch_size=%s\n' \
+    "${NUM_GENERATIONS}" "${GENERATION_BATCH_SIZE}"
+  printf 'global_batch_size=%s\n' "${GLOBAL_BATCH_SIZE}"
   printf 'weight_transport=versioned_rsync_atomic_symlink\n'
   printf 'lora_target_modules=linear_qkv,linear_fc1\n'
   printf 'trajectory_contract=llin-pi-trajectory-grpo-v2\n'
@@ -89,16 +119,16 @@ export LLIN_REMOTE_VLLM_VERSION=0.23.0
 } >"${RUN_DIR}/training_environment_summary.txt" 2>&1
 
 python -m torch.distributed.run \
-  --nproc_per_node 8 \
+  --nproc_per_node "${TRAIN_NPROC_PER_NODE}" \
   --master_port "${MASTER_PORT}" \
   /workspace/llin-rl-dpo/reference/ms-swift-padding-buckets/swift/cli/_megatron/rlhf.py \
   --rlhf_type grpo \
   --model "${MODEL}" \
   --dataset "${DATASET}" \
   --output_dir "${RUN_DIR}/output" \
-  --tensor_model_parallel_size 4 \
-  --pipeline_model_parallel_size 1 \
-  --context_parallel_size 2 \
+  --tensor_model_parallel_size "${TRAIN_TP_SIZE}" \
+  --pipeline_model_parallel_size "${TRAIN_PP_SIZE}" \
+  --context_parallel_size "${TRAIN_CP_SIZE}" \
   --sequence_parallel true \
   --tuner_type lora \
   --target_modules linear_qkv linear_fc1 \
@@ -118,8 +148,8 @@ python -m torch.distributed.run \
   --max_turns 16 \
   --reward_funcs pi_agent_trajectory_v2 \
   --loss_scale default \
-  --num_generations 8 \
-  --generation_batch_size 8 \
+  --num_generations "${NUM_GENERATIONS}" \
+  --generation_batch_size "${GENERATION_BATCH_SIZE}" \
   --steps_per_generation 1 \
   --max_length "${MAX_LENGTH}" \
   --max_completion_length "${COMPLETION_BUDGET}" \
@@ -127,7 +157,7 @@ python -m torch.distributed.run \
   --truncation_strategy delete \
   --padding_free false \
   --micro_batch_size 1 \
-  --global_batch_size 8 \
+  --global_batch_size "${GLOBAL_BATCH_SIZE}" \
   --train_iters "${TRAIN_ITERS}" \
   --beta 0.04 \
   --temperature 0.9 \

@@ -164,6 +164,8 @@ def sample_failure_reasons(sample: dict[str, Any]) -> list[str]:
         "length",
         "total_token_limit",
         "observation_token_limit",
+        "finalization_length",
+        "finalization_tool_call",
         "max_turns",
     }:
         reasons.append(f"stopped_{stopped_reason}")

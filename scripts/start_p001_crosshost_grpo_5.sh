@@ -13,7 +13,12 @@ SYNC_FILE="${RUN_DIR}/shared_lora_sync/adapter_flattened.pt"
 REMOTE_HOST=root@192.168.202.4
 REMOTE_RUN_DIR="/data3/llin/trajory_sft/runs/qwen36_27b_grpo_pi_agent_20260727/runs/${RUN_NAME}"
 REMOTE_SYNC_DIR="${REMOTE_RUN_DIR}/shared_lora_sync"
-CONTAINER=llin-qwen36-grpo-trainer-m05-p001-dpo-base
+CONTAINER="${PI_AGENT_TRAIN_CONTAINER:-llin-qwen36-grpo-trainer-m05-p001-dpo-base}"
+MAX_LENGTH="${PI_AGENT_MAX_LENGTH:-4096}"
+COMPLETION_BUDGET="${PI_AGENT_COMPLETION_BUDGET:-2048}"
+TRAIN_ITERS="${PI_AGENT_TRAIN_ITERS:-1}"
+MASTER_PORT="${PI_AGENT_MASTER_PORT:-29681}"
+GROUP_PORT="${PI_AGENT_GROUP_PORT:-28221}"
 
 case "${RUN_DIR}" in
   /data3/llin/qwen3.6-27b-trajory-dpo/online_grpo/runs/*) ;;
@@ -29,6 +34,13 @@ if [[ -e "${RUN_DIR}/control_started_at" ]]; then
 fi
 
 test "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}")" = true
+case "${CONTAINER}" in
+  llin-*) ;;
+  *)
+    printf 'refusing_non_llin_container=%s\n' "${CONTAINER}" >&2
+    exit 2
+    ;;
+esac
 ssh -o BatchMode=yes "${REMOTE_HOST}" "test -d '${REMOTE_RUN_DIR}'"
 
 mkdir -p "${RUN_DIR}/shared_lora_sync"
@@ -71,7 +83,8 @@ WATCHER_PID=$!
 printf '%s\n' "${WATCHER_PID}" >"${RUN_DIR}/lora_watcher.pid"
 
 nohup bash "${PROJECT_ROOT}/scripts/run_p001_online_grpo_train_host_5.sh" \
-  "${CONTAINER}" "${RUN_NAME}" 4096 2048 1 29681 28221 \
+  "${CONTAINER}" "${RUN_NAME}" "${MAX_LENGTH}" "${COMPLETION_BUDGET}" \
+  "${TRAIN_ITERS}" "${MASTER_PORT}" "${GROUP_PORT}" \
   >"${RUN_DIR}/training.log" 2>&1 &
 TRAIN_PID=$!
 printf '%s\n' "${TRAIN_PID}" >"${RUN_DIR}/training_host.pid"

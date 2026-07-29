@@ -14,7 +14,14 @@ TRAIN_LOSS_MARKER = "1"
 MASK_LOSS_MARKER = ""
 TERMINAL_STOP_REASON = "final_answer"
 TRUNCATED_STOP_REASONS = frozenset(
-    {"length", "max_turns", "observation_token_limit", "total_token_limit"}
+    {
+        "length",
+        "max_turns",
+        "observation_token_limit",
+        "total_token_limit",
+        "finalization_length",
+        "finalization_tool_call",
+    }
 )
 
 
@@ -61,6 +68,7 @@ def observation_token_allowance(
     per_tool_limit: int,
     policy_used: int,
     observation_used: int,
+    finalization_reserve: int = 0,
     safety_margin: int = 64,
 ) -> int:
     """Return the maximum tokens available to the next tool observation.
@@ -78,19 +86,23 @@ def observation_token_allowance(
         "per_tool_limit": per_tool_limit,
         "policy_used": policy_used,
         "observation_used": observation_used,
+        "finalization_reserve": finalization_reserve,
         "safety_margin": safety_margin,
     }
     if any(value < 0 for value in values.values()):
         raise ValueError(f"token budget values must be non-negative: {values}")
-    if policy_reserve + observation_limit > total_limit - safety_margin:
+    if observation_limit + finalization_reserve > total_limit - safety_margin:
         raise ValueError(
-            "policy_reserve + observation_limit must fit inside total_limit "
+            "observation_limit + finalization_reserve must fit inside total_limit "
             "after safety_margin"
         )
     remaining_total = max(
         total_limit - policy_used - observation_used - safety_margin, 0
     )
-    protected_policy = max(policy_reserve - policy_used, 0)
+    protected_policy = max(
+        policy_reserve - policy_used,
+        finalization_reserve,
+    )
     available_after_reserve = max(remaining_total - protected_policy, 0)
     remaining_observation = max(observation_limit - observation_used, 0)
     return min(per_tool_limit, remaining_observation, available_after_reserve)

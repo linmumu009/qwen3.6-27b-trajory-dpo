@@ -45,6 +45,10 @@ export PI_AGENT_TOTAL_TOKEN_LIMIT="${COMPLETION_BUDGET}"
 export PI_AGENT_POLICY_TOKEN_RESERVE="${PI_AGENT_POLICY_TOKEN_RESERVE:-768}"
 export PI_AGENT_OBSERVATION_TOKEN_LIMIT="${PI_AGENT_OBSERVATION_TOKEN_LIMIT:-1024}"
 export PI_AGENT_PER_TOOL_OBSERVATION_LIMIT="${PI_AGENT_PER_TOOL_OBSERVATION_LIMIT:-384}"
+export PI_AGENT_FINALIZATION_TOKEN_RESERVE="${PI_AGENT_FINALIZATION_TOKEN_RESERVE:-512}"
+export PI_AGENT_PER_TURN_POLICY_TOKEN_LIMIT="${PI_AGENT_PER_TURN_POLICY_TOKEN_LIMIT:-4096}"
+ROLLOUT_TP_SIZE="${PI_AGENT_ROLLOUT_TP_SIZE:-4}"
+ROLLOUT_DP_SIZE="${PI_AGENT_ROLLOUT_DP_SIZE:-2}"
 export PI_AGENT_MAX_TOOL_TIMEOUT=60
 export PI_AGENT_MAX_TOOL_OUTPUT=200000
 export PI_AGENT_COPY_CONCURRENCY=2
@@ -52,11 +56,23 @@ export PI_AGENT_V1_PLUGIN="${V1_PLUGIN}"
 export LLIN_SHARED_LORA_SYNC_FILE="/workspace/grpo_run/runs/${RUN_NAME}/shared_lora_sync/adapter_flattened.pt"
 export LLIN_SHARED_LORA_SYNC_ROLE=rollout
 
-if (( PI_AGENT_POLICY_TOKEN_RESERVE + PI_AGENT_OBSERVATION_TOKEN_LIMIT > COMPLETION_BUDGET - 64 )); then
-  printf 'invalid_v2_budget reserve=%s observation=%s total=%s\n' \
-    "${PI_AGENT_POLICY_TOKEN_RESERVE}" \
+if (( PI_AGENT_OBSERVATION_TOKEN_LIMIT + PI_AGENT_FINALIZATION_TOKEN_RESERVE > COMPLETION_BUDGET - 64 )); then
+  printf 'invalid_v2_budget observation=%s finalization=%s total=%s\n' \
     "${PI_AGENT_OBSERVATION_TOKEN_LIMIT}" \
+    "${PI_AGENT_FINALIZATION_TOKEN_RESERVE}" \
     "${COMPLETION_BUDGET}" >&2
+  exit 3
+fi
+VISIBLE_DEVICE_COUNT="$(awk -F, '{print NF}' <<<"${ASCEND_RT_VISIBLE_DEVICES}")"
+if (( ROLLOUT_TP_SIZE * ROLLOUT_DP_SIZE != VISIBLE_DEVICE_COUNT )); then
+  printf 'rollout_topology_device_mismatch tp=%s dp=%s visible=%s\n' \
+    "${ROLLOUT_TP_SIZE}" "${ROLLOUT_DP_SIZE}" "${VISIBLE_DEVICE_COUNT}" >&2
+  exit 3
+fi
+if (( PI_AGENT_POLICY_TOKEN_RESERVE < PI_AGENT_FINALIZATION_TOKEN_RESERVE )); then
+  printf 'policy_reserve_smaller_than_finalization reserve=%s finalization=%s\n' \
+    "${PI_AGENT_POLICY_TOKEN_RESERVE}" \
+    "${PI_AGENT_FINALIZATION_TOKEN_RESERVE}" >&2
   exit 3
 fi
 
@@ -70,8 +86,10 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
   printf 'policy_token_reserve=%s\n' "${PI_AGENT_POLICY_TOKEN_RESERVE}"
   printf 'observation_token_limit=%s\n' "${PI_AGENT_OBSERVATION_TOKEN_LIMIT}"
   printf 'per_tool_observation_limit=%s\n' "${PI_AGENT_PER_TOOL_OBSERVATION_LIMIT}"
+  printf 'finalization_token_reserve=%s\n' "${PI_AGENT_FINALIZATION_TOKEN_RESERVE}"
+  printf 'per_turn_policy_token_limit=%s\n' "${PI_AGENT_PER_TURN_POLICY_TOKEN_LIMIT}"
   printf 'http_port=%s\n' "${HTTP_PORT}"
-  printf 'rollout_topology=tp4_dp2\n'
+  printf 'rollout_topology=tp%s_dp%s\n' "${ROLLOUT_TP_SIZE}" "${ROLLOUT_DP_SIZE}"
   printf 'trajectory_contract=llin-pi-trajectory-grpo-v2\n'
   printf 'loss_contract=assistant_and_tool_call_only\n'
   printf 'reward_contract=sparse_terminal_outcome_plus_verified_progress\n'
@@ -95,8 +113,8 @@ python -c 'import vllm_ascend.ops.fused_moe.fused_moe; import runpy; runpy.run_m
   --host 127.0.0.1 \
   --port "${HTTP_PORT}" \
   --served_model_name Qwen3.6-27B \
-  --vllm_tensor_parallel_size 4 \
-  --vllm_data_parallel_size 2 \
+  --vllm_tensor_parallel_size "${ROLLOUT_TP_SIZE}" \
+  --vllm_data_parallel_size "${ROLLOUT_DP_SIZE}" \
   --vllm_max_model_len "${MAX_MODEL_LEN}" \
   --vllm_max_num_seqs 16 \
   --vllm_gpu_memory_utilization 0.90 \
