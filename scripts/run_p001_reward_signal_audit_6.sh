@@ -25,6 +25,7 @@ ROLLOUT_INNER="${PI_AGENT_ROLLOUT_INNER:-/workspace/grpo_run/shared/run_qwen36_g
 REWARD_CONTRACT="${PI_AGENT_REWARD_CONTRACT:-v1}"
 AUDIT_START_PROMPT="${PI_AGENT_AUDIT_START_PROMPT:-0}"
 AUDIT_END_PROMPT="${PI_AGENT_AUDIT_END_PROMPT:-20}"
+AUDIT_PROMPT_INDICES="${PI_AGENT_AUDIT_PROMPT_INDICES:-}"
 DEFER_SUMMARY="${PI_AGENT_DEFER_SUMMARY:-false}"
 CONTAINER_RUN_DIR="/workspace/grpo_run/runs/${RUN_NAME}"
 SYNC_DIR="${RUN_DIR}/shared_lora_sync"
@@ -96,7 +97,19 @@ printf '%s\n' "$(date -Is)" >"${RUN_DIR}/host_started_at"
   printf 'policy_source_run=%s\n' "p001_crosshost_grpo_1step_20260728_r4"
   printf 'policy_lora_sha256=%s\n' "${R4_LORA_SHA256}"
   printf 'policy_update_performed=false\n'
-  printf 'prompt_count=20\nsamples_per_prompt=8\ntrajectory_count=160\n'
+  if [[ -n "${AUDIT_PROMPT_INDICES}" ]]; then
+    NORMALIZED_PROMPT_INDICES="${AUDIT_PROMPT_INDICES//,/ }"
+    read -r -a SELECTED_PROMPT_INDICES <<<"${NORMALIZED_PROMPT_INDICES}"
+    for index in "${SELECTED_PROMPT_INDICES[@]}"; do
+      [[ "${index}" =~ ^[0-9]+$ ]] || exit 2
+    done
+    printf 'prompt_count=%s\nsamples_per_prompt=8\ntrajectory_count=%s\n' \
+      "${#SELECTED_PROMPT_INDICES[@]}" "$(( ${#SELECTED_PROMPT_INDICES[@]} * 8 ))"
+  else
+    printf 'prompt_count=%s\nsamples_per_prompt=8\ntrajectory_count=%s\n' \
+      "$(( AUDIT_END_PROMPT - AUDIT_START_PROMPT ))" \
+      "$(( (AUDIT_END_PROMPT - AUDIT_START_PROMPT) * 8 ))"
+  fi
   printf 'max_model_len=%s\ncompletion_budget=%s\n' \
     "${MAX_MODEL_LEN}" "${COMPLETION_BUDGET}"
   printf 'temperature=0.9\ntop_p=0.95\n'
@@ -104,6 +117,7 @@ printf '%s\n' "$(date -Is)" >"${RUN_DIR}/host_started_at"
   printf 'rollout_inner=%s\n' "${ROLLOUT_INNER}"
   printf 'reward_contract=%s\n' "${REWARD_CONTRACT}"
   printf 'audit_prompt_range=%s:%s\n' "${AUDIT_START_PROMPT}" "${AUDIT_END_PROMPT}"
+  printf 'audit_prompt_indices=%s\n' "${AUDIT_PROMPT_INDICES:-none}"
   printf 'defer_summary=%s\n' "${DEFER_SUMMARY}"
   docker inspect -f \
     'image={{.Config.Image}} status={{.State.Status}} privileged={{.HostConfig.Privileged}} network={{.HostConfig.NetworkMode}} ipc={{.HostConfig.IpcMode}}' \
@@ -169,11 +183,17 @@ docker exec "${CONTAINER}" python "${LOAD_SCRIPT}" \
   >"${RUN_DIR}/adapter_load_summary.json"
 
 set +e
-AUDIT_EXTRA_ARGS=(
-  --reward-contract "${REWARD_CONTRACT}"
-  --start-prompt "${AUDIT_START_PROMPT}"
-  --end-prompt "${AUDIT_END_PROMPT}"
-)
+AUDIT_EXTRA_ARGS=(--reward-contract "${REWARD_CONTRACT}")
+if [[ -n "${AUDIT_PROMPT_INDICES}" ]]; then
+  NORMALIZED_PROMPT_INDICES="${AUDIT_PROMPT_INDICES//,/ }"
+  read -r -a SELECTED_PROMPT_INDICES <<<"${NORMALIZED_PROMPT_INDICES}"
+  AUDIT_EXTRA_ARGS+=(--prompt-indices "${SELECTED_PROMPT_INDICES[@]}")
+else
+  AUDIT_EXTRA_ARGS+=(
+    --start-prompt "${AUDIT_START_PROMPT}"
+    --end-prompt "${AUDIT_END_PROMPT}"
+  )
+fi
 if [[ "${DEFER_SUMMARY}" == true ]]; then
   AUDIT_EXTRA_ARGS+=(--defer-summary)
 fi

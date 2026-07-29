@@ -19,6 +19,7 @@ from pi_trajectory_contract import (
     TRAIN_LOSS_MARKER,
     annotate_action_loss,
     observation_token_allowance,
+    queue_masked_finalization,
     reward_decision,
 )
 
@@ -108,6 +109,11 @@ class PiAgentSchedulerV2(v1.PiAgentScheduler):
         finalization_pending = False
         finalization_triggered = False
         finalization_succeeded = False
+        finalization_instruction = (
+            "The environment observation budget is exhausted. "
+            "Do not call any more tools. Give the best grounded final "
+            "answer using only the evidence already observed."
+        )
 
         while True:
             turn_config = copy.copy(request_config)
@@ -253,16 +259,9 @@ class PiAgentSchedulerV2(v1.PiAgentScheduler):
                 if remaining_for_finalization <= 64:
                     stopped_reason = "observation_token_limit"
                     break
-                infer_request.messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "The environment observation budget is exhausted. "
-                            "Do not call any more tools. Give the best grounded final "
-                            "answer using only the evidence already observed."
-                        ),
-                        "loss": MASK_LOSS_MARKER,
-                    }
+                queue_masked_finalization(
+                    infer_request.messages,
+                    finalization_instruction,
                 )
                 finalization_pending = True
                 finalization_triggered = True
@@ -273,16 +272,9 @@ class PiAgentSchedulerV2(v1.PiAgentScheduler):
                     self.total_token_limit - policy_tokens - observation_tokens
                 )
                 if remaining_for_finalization > 64:
-                    infer_request.messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "The environment observation budget is exhausted. "
-                                "Do not call any more tools. Give the best grounded final "
-                                "answer using only the evidence already observed."
-                            ),
-                            "loss": MASK_LOSS_MARKER,
-                        }
+                    queue_masked_finalization(
+                        infer_request.messages,
+                        finalization_instruction,
                     )
                     finalization_pending = True
                     finalization_triggered = True

@@ -12,6 +12,7 @@ from pi_trajectory_contract import (  # noqa: E402
     annotate_action_loss,
     classify_tool_failure,
     observation_token_allowance,
+    queue_masked_finalization,
     reward_decision,
 )
 
@@ -139,6 +140,29 @@ class PiTrajectoryContractTest(unittest.TestCase):
             ),
             0,
         )
+
+    def test_finalization_merges_into_masked_tool_observation(self):
+        messages = [
+            {"role": "assistant", "content": "analysis", "loss": "1"},
+            {"role": "tool_call", "content": "{}", "loss": "1"},
+            {
+                "role": "tool_response",
+                "content": "environment output",
+                "loss": "",
+            },
+        ]
+        queue_masked_finalization(messages, "Give the grounded final answer.")
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(messages[-1]["role"], "tool_response")
+        self.assertEqual(messages[-1]["loss"], "")
+        self.assertIn("environment output", messages[-1]["content"])
+        self.assertIn("Give the grounded final answer.", messages[-1]["content"])
+
+    def test_finalization_after_policy_action_adds_masked_user_message(self):
+        messages = [{"role": "assistant", "content": "analysis", "loss": "1"}]
+        queue_masked_finalization(messages, "Give the grounded final answer.")
+        self.assertEqual(messages[-1]["role"], "user")
+        self.assertEqual(messages[-1]["loss"], "")
 
     def test_failed_forced_finalization_is_truncated(self):
         decision = reward_decision(

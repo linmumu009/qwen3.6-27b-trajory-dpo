@@ -60,6 +60,35 @@ def annotate_action_loss(
     return annotated
 
 
+def queue_masked_finalization(
+    messages: list[dict[str, Any]],
+    instruction: str,
+) -> None:
+    """Queue a masked final-answer instruction without breaking tool dialogue.
+
+    A tool response must be followed by the assistant's next generation.  Adding
+    a separate user message after a tool response makes the ms-swift template
+    treat that user message as a response role and reject the request.  Merge
+    the instruction into the masked observation in that case; after a policy
+    action, a regular masked user message remains valid.
+    """
+    if not instruction.strip():
+        raise ValueError("finalization instruction must not be empty")
+    if messages and messages[-1].get("role") in {"tool_response", "user"}:
+        previous = messages[-1].get("content")
+        previous_text = previous if isinstance(previous, str) else str(previous or "")
+        messages[-1]["content"] = f"{previous_text}\n\n{instruction}".strip()
+        messages[-1]["loss"] = MASK_LOSS_MARKER
+        return
+    messages.append(
+        {
+            "role": "user",
+            "content": instruction,
+            "loss": MASK_LOSS_MARKER,
+        }
+    )
+
+
 def observation_token_allowance(
     *,
     total_limit: int,

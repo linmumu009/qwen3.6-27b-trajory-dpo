@@ -95,6 +95,38 @@ def describe(values: list[float]) -> dict[str, float | int | None]:
     }
 
 
+def resolve_prompt_indices(
+    *,
+    row_count: int,
+    start_prompt: int,
+    end_prompt: int | None,
+    prompt_indices: list[int] | None,
+) -> list[int]:
+    if row_count <= 0:
+        raise ValueError("dataset is empty")
+    if prompt_indices:
+        if start_prompt != 0 or end_prompt is not None:
+            raise ValueError(
+                "--prompt-indices cannot be combined with --start-prompt/--end-prompt"
+            )
+        selected = list(dict.fromkeys(prompt_indices))
+        if len(selected) != len(prompt_indices):
+            raise ValueError("--prompt-indices contains duplicates")
+        if any(index < 0 or index >= row_count for index in selected):
+            raise ValueError(
+                f"prompt indices {selected} outside dataset of {row_count} rows"
+            )
+        return selected
+
+    resolved_end = row_count if end_prompt is None else end_prompt
+    if not 0 <= start_prompt < resolved_end <= row_count:
+        raise ValueError(
+            f"invalid prompt range [{start_prompt}, {resolved_end}) "
+            f"for {row_count} rows"
+        )
+    return list(range(start_prompt, resolved_end))
+
+
 def prompt_identity(row: dict[str, Any]) -> tuple[str | None, str | None, str | None]:
     metadata = row.get("metadata") or {}
     environment = metadata.get("environment") or {}
@@ -363,6 +395,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=1800.0)
     parser.add_argument("--start-prompt", type=int, default=0)
     parser.add_argument("--end-prompt", type=int)
+    parser.add_argument("--prompt-indices", type=int, nargs="+")
     parser.add_argument("--defer-summary", action="store_true")
     parser.add_argument(
         "--reward-contract",
@@ -383,13 +416,13 @@ def main() -> int:
             raise FileNotFoundError(path)
 
     rows = load_jsonl(dataset)
-    if not rows:
-        raise ValueError("dataset is empty")
-    end_prompt = len(rows) if args.end_prompt is None else args.end_prompt
-    if not 0 <= args.start_prompt < end_prompt <= len(rows):
-        raise ValueError(
-            f"invalid prompt range [{args.start_prompt}, {end_prompt}) for {len(rows)} rows"
-        )
+    selected_prompt_indices = resolve_prompt_indices(
+        row_count=len(rows),
+        start_prompt=args.start_prompt,
+        end_prompt=args.end_prompt,
+        prompt_indices=args.prompt_indices,
+    )
+    selected_prompt_set = set(selected_prompt_indices)
     plugin = load_plugin(plugin_path)
     manifest = plugin.load_manifest(str(manifest_path))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -415,7 +448,7 @@ def main() -> int:
     endpoint = f"{args.base_url.rstrip('/')}/infer/"
 
     for prompt_index, row in enumerate(rows):
-        if not args.start_prompt <= prompt_index < end_prompt:
+        if prompt_index not in selected_prompt_set:
             continue
         group_path = groups_dir / f"prompt_{prompt_index:03d}.json"
         if group_path.is_file():
@@ -536,8 +569,7 @@ def main() -> int:
             stable_json(
                 {
                     "event": "audit_shard_complete",
-                    "start_prompt": args.start_prompt,
-                    "end_prompt": end_prompt,
+                    "prompt_indices": selected_prompt_indices,
                 }
             ),
             flush=True,
@@ -545,7 +577,7 @@ def main() -> int:
         return 0
 
     all_samples: list[dict[str, Any]] = []
-    for prompt_index in range(len(rows)):
+    for prompt_index in selected_prompt_indices:
         group_path = groups_dir / f"prompt_{prompt_index:03d}.json"
         if not group_path.is_file():
             raise RuntimeError(f"missing completed group: {group_path}")

@@ -48,6 +48,24 @@ def make_sample(prompt_index: int, sample_index: int, reward: float, trajectory:
 
 
 class RewardSignalAuditTest(unittest.TestCase):
+    def test_resolve_prompt_indices_preserves_noncontiguous_original_indices(self):
+        self.assertEqual(
+            audit.resolve_prompt_indices(
+                row_count=20,
+                start_prompt=0,
+                end_prompt=None,
+                prompt_indices=[2, 10, 11],
+            ),
+            [2, 10, 11],
+        )
+        with self.assertRaises(ValueError):
+            audit.resolve_prompt_indices(
+                row_count=20,
+                start_prompt=0,
+                end_prompt=None,
+                prompt_indices=[2, 2],
+            )
+
     def test_make_request_passes_dataset_metadata_via_data_dict(self):
         row = {
             "messages": [{"role": "user", "content": "question"}],

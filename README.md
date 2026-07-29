@@ -34,7 +34,7 @@ verified RPO 相对 matched continued-SFT：
 
 因此下一轮以 **chosen-SFT warm start + verified RPO** 为主线；普通 DPO保留为对照，不作为默认训练目标。
 
-多机工程方面，`5 号训练 + 6 号在线 rollout` 的同步 GRPO 已从半机 8 卡扩展到两台各 16 张计算 NPU，并完成 40K 上下文的真实单步闭环：5 号采用 `TP8 × PP1 × CP2 × SP`，6 号采用 `TP8 × DP2`；初始 LoRA 由 5 号直接 rsync 到 6 号，经 SHA256、版本目录和原子 symlink 发布后由全部 rollout worker 确认加载。最新单步产生 16 条轨迹，reward 为 `0×3 / 0.2×2 / 1×11`，16/16 advantage 非零且 finite；随后完成反向更新和 checkpoint-1。该结果证明 40K 全机工程闭环和有效优化信号，不等同于独立 heldout 上的模型效果提升。此前半机 smoke 的 8 条 reward 全为 `0.3`、advantage 全为 `0`；后续 reward-signal audit 在用户停止前完成 17/20 个 prompt、共 136 条轨迹，其中 16 组存在非零旧 reward 方差，但 66.9% 轨迹命中总 token 上限，旧 reward 仍大量集中在 `0.3`。
+多机工程方面，`5 号训练 + 6 号在线 rollout` 的同步 GRPO 已从半机 8 卡扩展到两台各 16 张计算 NPU，并完成 40K 上下文的真实多提示单步闭环：5 号采用 `TP8 × PP1 × CP2 × SP`，6 号采用 `TP8 × DP2`；初始 LoRA 由 5 号直接 rsync 到 6 号，经 SHA256、版本目录和原子 symlink 发布后由全部 rollout worker 确认加载。最新修正版单步使用 prompt 2/10，各生成 8 条轨迹，reward 为 `0×4 / 0.2×3 / 1×9`，16/16 advantage 非零且 finite；关闭 1-step warmup 后，更新 checkpoint 的 LoRA-B、Megatron BF16 model 和 FP32 optimizer master 均确认非零且 finite，HF adapter SHA256 变为 `eddb8468ac5874eeef7931adf5bb803573867bd1ecab04faedabb5449ff64cf8`。该结果证明 40K 全机工程闭环、有效优化信号和真实参数更新，不等同于独立 heldout 上的模型效果提升。此前把 warmup=3% 的 1-step run 记为“权重已更新”是不准确的：它完成了反向和 checkpoint，但首步实际学习率为 0，LoRA-B 未变化。
 
 对这 136 条历史轨迹进行 v2 反事实重放后，确认纯终局 reward 过稀疏：只有 4/17 组具有方差；保守混合 reward 为 12/17 组保留方差。当前在线 GRPO 默认契约因此改为：只训练 assistant 内容与 tool call，工具执行结果只作为下一步观察而不进入 loss；`1.0` 只奖励安全、协议有效、成功查询必需表且命中 gold evidence 的终局答案，`0.2` 只奖励同样满足前置条件但尚未命中 gold 的终局验证进展；截断、仅安全调用、仅有答案或一般工具成功均为 `0`。不采用“每一步都给分”的稠密过程奖励，除非后续获得独立、校准过的 step verifier。
 
@@ -78,7 +78,7 @@ verified RPO 相对 matched continued-SFT：
 
 ## 下一轮实验：P-001 轨迹 RPO pilot
 
-状态：`data-frozen / multihost-data-plane-passed / trajectory-grpo-v2-engineered / maxctx40k-full-machine-1step-passed / no-long-run-authorized`
+状态：`data-frozen / multihost-data-plane-passed / trajectory-grpo-v2-engineered / maxctx40k-multiprompt-real-update-1step-passed / no-long-run-authorized`
 
 ### 目标
 
@@ -657,7 +657,7 @@ r5 额外证据：
 |---|---|---|
 | `p001_crosshost_grpo_v2_maxctx40k_1step_20260729_r1` | 参数校验失败，无训练 | 16-rank world 下 `generation_batch_size=8` 导致 per-device generation batch 为 0。未加载模型、未 rollout、未更新权重；清理两机进程和 NPU。 |
 | `p001_crosshost_grpo_v2_maxctx40k_1step_20260729_r2` | 参数校验失败，无训练 | 将 generation batch 提高到 16 后，框架要求它等于 `global_batch_size × steps_per_generation`；旧 global batch 仍为 8。未加载模型、未 rollout、未更新权重；清理两机进程和 NPU。 |
-| `p001_crosshost_grpo_v2_maxctx40k_1step_20260729_r3` | 成功 | 固定 `generation/global batch=16/16`、`num_generations=8`、`steps_per_generation=1`；完成 16 条轨迹、1 次 optimizer step 和 checkpoint-1。 |
+| `p001_crosshost_grpo_v2_maxctx40k_1step_20260729_r3` | 工程通过、参数未变化 | 固定 `generation/global batch=16/16`、`num_generations=8`、`steps_per_generation=1`；完成 16 条轨迹、反向和 checkpoint-1。后续 E-009 发现 1-step warmup 令本步实际学习率为 0，LoRA-B 未更新。 |
 
 r3 同步与训练证据：
 
@@ -691,9 +691,10 @@ r3 同步与训练证据：
   - SHA256：`64278ca231ed4f4a26b0ed75484601eb609b1b1e41ee26c5d6ddae69bdb395f8`；
   - 未将轨迹正文复制到 Windows 或 GitHub。
 
-结论与后续门禁：
+结论与后续门禁（经 E-009 追溯更正）：
 
-- 已证明两台各 16 张计算 NPU、40K 上下文、服务器内网权重同步、在线多轮工具轨迹、v2 reward、反向更新和 checkpoint 的完整工程闭环。
+- 已证明两台各 16 张计算 NPU、40K 上下文、服务器内网权重同步、在线多轮工具轨迹、v2 reward、反向计算和 checkpoint 的完整工程链路。
+- r3 的 Adam moment 非零，但 LoRA-B、FP32 master B 和 HF adapter 均未变化；不能再将 r3 单独作为“参数已更新”的证据。真实参数更新由 E-009 的 warmup=0 修正版单步证明。
 - 已证明本次单题的两个 group 都有非零 reward 方差和 advantage；不同于旧半机 smoke 的全零 advantage。
 - 尚未证明模型效果提升：当前只有一个 prompt，且因为全机 batch 对齐被重复成两个 group；不得把单步 reward 或训练 loss 当成 heldout 改善。
 - 长跑前仍需冻结多个 verifier 可信且组内方差非零的 prompt，保留 chosen-SFT / continued-SFT / verified-RPO 对照，并运行独立 heldout 评测。
@@ -704,3 +705,67 @@ r3 同步与训练证据：
 - 28220/28221/29693 无监听；两机 `npu-smi` 均显示所有 NPU `No running processes found`。
 - 两个新自有容器仍为 running，但内部都只有 `sleep infinity`，不占用 NPU。
 - r1、r2 失败证据，r3 成功证据、checkpoint、哈希和日志全部保留；没有自动启动下一步或长跑。
+
+### 2026-07-29：E-009 多提示 40K 审计、首步 warmup 修复与真实参数更新
+
+目标与边界：
+
+- 在长跑前用多个 verifier 可信、组内 reward 方差非零的 prompt 复验 v2 轨迹质量。
+- 首个多提示 batch 固定为两个 prompt × 每组 8 条 = 16 条，只做 1 个 optimizer step。
+- Windows 只发送 SSH 控制命令；数据集、轨迹、LoRA、checkpoint 和 5→6 同步均留在服务器。
+- 只使用自有 `llin-*` 容器/镜像；不启动长跑，不以单步训练指标宣称模型效果提升。
+
+协议与审计更新：
+
+- `audit_online_grpo_reward_signal.py` 新增非连续原始 prompt index 选择，避免重排后丢失任务身份。
+- v2 scheduler 修复受控 finalization 的消息边界：工具观察后不再追加破坏模板角色序列的独立 user message，而是将被 mask 的最终回答指令合并到最后一条 observation；工具输出仍不参与 loss。
+- 本地轨迹/审计回归测试 14/14 通过；5/6 号部署的 scheduler 和 contract SHA256 分别一致为：
+  - scheduler：`8a18acf09c8a83bc1128be2da4ca64952a3db4aeba4f5b191c14f093ec7947f6`
+  - contract：`390751f6b8d56889a08ad341add822c0d509773a86467348be936cb08e8c3afc`
+
+40K 无训练审计：
+
+| run | prompt | 结果 |
+|---|---:|---|
+| `p001_trajectory_v2_prompts2_10_11_maxctx40k_audit_20260729_r1` | 2/10/11 | prompt 2 完成后，prompt 10 触发 `response_role: user` 模板断言；无训练、自动清理。prompt 2 为 `1×5 / 0×3`，8/8 终局。 |
+| `p001_trajectory_v2_prompt10_maxctx40k_finalization_fix_20260729_r2` | 10 | 8/8 HTTP 成功；`1×5 / 0×3`，7/8 终局、1/8 max-turn 截断。 |
+| `p001_trajectory_v2_prompt11_maxctx40k_finalization_fix_20260729_r3` | 11 | 8/8 HTTP 成功；`1×5 / 0×3`，6/8 终局、2/8 max-turn 截断。 |
+
+- 三个 prompt 都有非零组内 reward 方差；合计 24 条中 21 条终局，终局率 87.5%。
+- 24/24 工具协议有效且有成功工具调用。
+- prompt 2/10 的 required-table 覆盖均为 8/8；prompt 11 只有 5/8，故首个训练 batch 选择 2+10，将 11 保留为后续难例/课程组。
+- 两行训练集在 5 号服务器内生成，SHA256：`80a642c8a9ecf3958805f53dbb8eed1a1e205eacfda77a4d088f89cc85e3d521`；未输出数据正文。
+
+多提示单步与零学习率追溯：
+
+| run | 结果 | 说明 |
+|---|---|---|
+| `p001_crosshost_grpo_v2_prompts2_10_maxctx40k_1step_20260729_r1` | 反向通过、参数未变化 | 16 条轨迹、两组 reward 方差非零、16/16 advantage finite；但沿用 `lr_warmup_fraction=0.03`，1-step 实际学习率为 0。DCP model/master LoRA-B 仍全零，HF adapter 哈希仍为初始化值 `f2341828...`。 |
+| `p001_crosshost_grpo_v2_prompts2_10_maxctx40k_warmup0_1step_20260729_r2` | 真实参数更新通过 | 唯一训练差异是显式 `lr_warmup_fraction=0`；完成 16 条轨迹、反向、optimizer step 和 checkpoint-1。 |
+
+warmup=0 修正版证据：
+
+- reward：`0×4 / 0.2×3 / 1×9`，均值 `0.6000`，总体 reward std `0.3618`。
+- prompt 2：`1×7 / 0.2×1`，组内标准差 `0.2646`。
+- prompt 10：`1×2 / 0.2×2 / 0×4`，组内标准差 `0.4123`。
+- advantage：16/16 非零且 finite，范围 `[-2.4740, 1.5877]`。
+- loss `1.1174e-4`、KL `7.754e-5`、grad norm `0.06853`，全部 finite；无 OOM、HTTP 500、模板断言或 RuntimeError。
+- checkpoint：
+  - `latest_checkpointed_iteration.txt == 1`
+  - HF adapter：408 tensors、全部 finite、SHA256 `eddb8468ac5874eeef7931adf5bb803573867bd1ecab04faedabb5449ff64cf8`
+  - HF LoRA-B：204 个 tensor 中 176 个非零
+  - DCP BF16 model / FP32 master：108 个 fused B 中均有 80 个非零
+  - BF16 model 与 FP32 master 最大绝对差：`2.98e-08`
+- completions 只留在 5 号服务器，SHA256：`45e141c7f34e5b149a3e1df8e6ece0b3ba16752252cce78006a1c37e028fb102`；未复制轨迹正文。
+
+结论与后续门禁：
+
+- 现已证明 40K、两台各 16 NPU、两个真实 prompt、服务器内网权重同步、有效组内 advantage、实际 optimizer 参数变化和可用 HF adapter 的完整闭环。
+- 1-step smoke 必须显式关闭 warmup，或至少运行超过 warmup 区间；今后“训练成功”门禁必须包含 LoRA-B 非零和更新前后权重哈希/数值差，不再只看 grad norm、iteration 或 checkpoint 存在。
+- 尚未证明 heldout 效果提升；长跑仍未授权。下一阶段应冻结 matched 起点与独立 heldout，对 continued-SFT / 普通 DPO / verified RPO / trajectory-GRPO 做同预算比较。
+
+最终资源状态：
+
+- 5、6 号本次训练、rollout、SSH tunnel 和 LoRA watcher 均按精确 PID 停止。
+- 28220/28221/29694 无监听；两机 NPU 均显示 `No running processes found`。
+- 两个自有全机容器保持 running，但内部只有 `sleep infinity`，不占用 NPU。

@@ -62,6 +62,7 @@ TRAIN_PP_SIZE="${PI_AGENT_TRAIN_PP_SIZE:-1}"
 GENERATION_BATCH_SIZE="${PI_AGENT_GENERATION_BATCH_SIZE:-8}"
 NUM_GENERATIONS="${PI_AGENT_NUM_GENERATIONS:-8}"
 GLOBAL_BATCH_SIZE="${PI_AGENT_GLOBAL_BATCH_SIZE:-8}"
+LR_WARMUP_FRACTION="${PI_AGENT_LR_WARMUP_FRACTION:-0.03}"
 if (( TRAIN_TP_SIZE * TRAIN_CP_SIZE * TRAIN_PP_SIZE != TRAIN_NPROC_PER_NODE )); then
   printf 'train_topology_world_size_mismatch nproc=%s tp=%s cp=%s pp=%s\n' \
     "${TRAIN_NPROC_PER_NODE}" "${TRAIN_TP_SIZE}" \
@@ -83,6 +84,10 @@ if (( GENERATION_BATCH_SIZE != GLOBAL_BATCH_SIZE )); then
     "${GENERATION_BATCH_SIZE}" "${GLOBAL_BATCH_SIZE}" >&2
   exit 3
 fi
+if ! [[ "${LR_WARMUP_FRACTION}" =~ ^(0|0\.[0-9]+|1(\.0+)?)$ ]]; then
+  printf 'invalid_lr_warmup_fraction=%s\n' "${LR_WARMUP_FRACTION}" >&2
+  exit 3
+fi
 
 {
   printf 'started_at=%s\n' "$(date -Is)"
@@ -97,6 +102,7 @@ fi
   printf 'num_generations=%s\ngeneration_batch_size=%s\n' \
     "${NUM_GENERATIONS}" "${GENERATION_BATCH_SIZE}"
   printf 'global_batch_size=%s\n' "${GLOBAL_BATCH_SIZE}"
+  printf 'lr_warmup_fraction=%s\n' "${LR_WARMUP_FRACTION}"
   printf 'weight_transport=versioned_rsync_atomic_symlink\n'
   printf 'lora_target_modules=linear_qkv,linear_fc1\n'
   printf 'trajectory_contract=llin-pi-trajectory-grpo-v2\n'
@@ -163,7 +169,7 @@ python -m torch.distributed.run \
   --temperature 0.9 \
   --top_p 0.95 \
   --lr 1e-5 \
-  --lr_warmup_fraction 0.03 \
+  --lr_warmup_fraction "${LR_WARMUP_FRACTION}" \
   --min_lr 1e-6 \
   --lr_decay_style cosine \
   --weight_decay 0.0 \
