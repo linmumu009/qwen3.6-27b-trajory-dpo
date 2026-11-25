@@ -1,0 +1,6 @@
+# Raw evidence and decryption key must stay local: origin is a public repository.
+*
+!.gitignore
+!README.md
+!public_manifest.json
+!restore_backup.py
